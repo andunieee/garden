@@ -1,0 +1,70 @@
+# garden admin settings. run with `garden garden.toml` (or GARDEN_CONFIG=garden.toml)
+
+listen = "0.0.0.0:3000"
+public_url = "https://cdn.example.com"
+data_dir = "./data"
+
+# bearer token for /admin/*, leave empty to disable the admin api
+admin_token = "change-me"
+
+[restrictions]
+max_file_size = 104857600            # 100 MiB
+allowed_mime_types = []              # e.g. ["image/*", "application/pdf"], empty means anything
+allowed_pubkeys = []                 # hex, empty means anyone
+denied_pubkeys = []                  # hex
+min_account_payment_sats = 1000
+min_order_sats = 100
+max_files_per_order = 100
+order_retention_hours = 168
+
+[pricing]
+# rent per day = base_sats_per_day + ceil(size in MiB * sats_per_mib_per_day)
+base_sats_per_day = 1
+sats_per_mib_per_day = 0.1
+# new files are funded to last at least this long (30 is the minimum)
+min_days = 30
+
+[ledger]
+kind = "tigerbeetle"
+cluster_id = 0
+addresses = "127.0.0.1:3001"
+# kind = "memory"   # development only, forgets everything on restart
+
+[payments]
+kind = "arkade"
+server_url = "https://arkade.computer"
+# 32 bytes in hex, or use the GARDEN_ARKADE_SEED environment variable. whoever has this seed
+# controls the money received, back it up.
+seed = "0000000000000000000000000000000000000000000000000000000000000001"
+poll_secs = 5
+# kind = "mock"     # development only, orders are confirmed through /admin/orders/<id>/confirm
+
+# file hosting providers. new files go to a random enabled one (by weight), and each file is
+# served from the provider it was uploaded to. never change or reuse an `id`.
+[[provider]]
+id = 1
+kind = "b2"
+bucket = "my-bucket"
+region = "us-west-004"
+endpoint = "https://s3.us-west-004.backblazeb2.com"
+access_key_id = "..."
+secret_access_key = "..."
+public_url = "https://f004.backblazeb2.com/file/my-bucket"
+
+[[provider]]
+id = 2
+kind = "s3"
+bucket = "my-other-bucket"
+region = "us-east-1"
+access_key_id = "..."
+secret_access_key = "..."
+
+[[provider]]
+id = 3
+kind = "r2"
+bucket = "my-r2-bucket"
+region = "auto"
+endpoint = "https://ACCOUNT_ID.r2.cloudflarestorage.com"
+access_key_id = "..."
+secret_access_key = "..."
+public_url = "https://pub-xxxx.r2.dev"

@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>garden</title>
+<style>
+  :root {
+    --bg: #f6f5f1; --card: #fff; --ink: #1d2a1f; --muted: #667267; --line: #dcdfd6;
+    --accent: #2f7d4a; --accent-ink: #fff; --warn: #a8531b; --bad: #b3261e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #141a15; --card: #1c241d; --ink: #e6ece6; --muted: #98a499; --line: #2c372d;
+            --accent: #5fb87e; --accent-ink: #0d1a11; --warn: #e0925a; --bad: #f2877f; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 16px/1.5 system-ui, sans-serif; }
+  main { max-width: 640px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { margin: 0 0 4px; font-size: 28px; }
+  h2 { margin: 0 0 8px; font-size: 18px; }
+  p { margin: 0 0 12px; }
+  .muted { color: var(--muted); font-size: 14px; }
+  section { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-top: 16px; }
+  label { display: block; font-size: 14px; color: var(--muted); margin: 8px 0 2px; }
+  input { width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px;
+          background: var(--bg); color: var(--ink); font: inherit; }
+  button { padding: 8px 14px; border: 0; border-radius: 6px; background: var(--accent); color: var(--accent-ink);
+           font: inherit; font-weight: 600; cursor: pointer; margin-top: 10px; }
+  button:disabled { opacity: .5; cursor: default; }
+  button.plain { background: none; color: var(--accent); border: 1px solid var(--line); }
+  code, .mono { font-family: ui-monospace, monospace; font-size: 13px; word-break: break-all; }
+  .err { color: var(--bad); } .ok { color: var(--accent); } .warn { color: var(--warn); }
+  .row { display: flex; gap: 8px; } .row > * { flex: 1; } .row > .narrow { flex: 0 0 110px; }
+  .order { border-top: 1px dashed var(--line); margin-top: 12px; padding-top: 12px; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>garden</h1>
+  <p class="muted">Files live here as long as there are sats in their account. Anyone can add sats to any file, nobody can delete one.</p>
+
+  <section id="login">
+    <h2>Account</h2>
+    <p id="who" class="muted">Sign in with a nostr extension (NIP-07) to upload.</p>
+    <button id="connect">Sign in</button>
+    <div id="acct" class="hidden">
+      <p>Balance: <b id="balance">0</b> sats <span id="noacct" class="warn hidden">(no account yet, pay to create it)</span></p>
+      <label for="credit">Add sats to your account</label>
+      <div class="row"><input id="credit" type="number" min="1" value="1000"><button id="credit-go" class="narrow">Pay</button></div>
+    </div>
+  </section>
+
+  <section id="upload-box" class="hidden">
+    <h2>Upload</h2>
+    <p class="muted" id="price"></p>
+    <input id="file" type="file">
+    <button id="upload-go">Upload</button>
+    <p id="upload-out"></p>
+  </section>
+
+  <section>
+    <h2>Keep files alive</h2>
+    <p class="muted">No account needed. Pick any files already here and pay for them in one go.</p>
+    <div id="fund-rows"></div>
+    <button class="plain" id="add-row">Add another file</button>
+    <button id="fund-go">Pay</button>
+    <p id="fund-out" class="err"></p>
+  </section>
+
+  <section>
+    <h2>Look up a file</h2>
+    <input id="lookup" placeholder="sha256">
+    <button class="plain" id="lookup-go">Look up</button>
+    <p id="lookup-out"></p>
+  </section>
+
+  <div id="orders"></div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let pubkey = null;
+let info = null;
+
+const hex = (buf) => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
+const sha256 = async (buf) => hex(await crypto.subtle.digest('SHA-256', buf));
+const say = (el, text, cls = '') => { el.textContent = text; el.className = cls; };
+
+// the Authorization header of blossom (BUD-01): a signed event of kind 24242
+async function authHeader(verb, hashes = []) {
+  const now = Math.floor(Date.now() / 1000);
+  const event = await window.nostr.signEvent({
+    kind: 24242,
+    created_at: now,
+    content: verb,
+    tags: [['t', verb], ['expiration', String(now + 300)], ...hashes.map((h) => ['x', h])],
+  });
+  const bytes = new TextEncoder().encode(JSON.stringify(event));
+  return 'Nostr ' + btoa(String.fromCharCode(...bytes));
+}
+
+async function api(method, path, { body, auth } = {}) {
+  const headers = {};
+  if (body !== undefined) headers['content-type'] = 'application/json';
+  if (auth) headers.authorization = auth;
+  const res = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
+}
+
+async function refreshAccount() {
+  const a = await api('GET', '/api/account', { auth: await authHeader('account') });
+  $('balance').textContent = a.balance_sats;
+  $('noacct').classList.toggle('hidden', a.exists);
+}
+
+$('connect').onclick = async () => {
+  if (!window.nostr) return say($('who'), 'No nostr extension found.', 'err');
+  try {
+    pubkey = await window.nostr.getPublicKey();
+    say($('who'), 'Signed in as ' + pubkey.slice(0, 12) + '…', 'mono');
+    $('connect').classList.add('hidden');
+    $('acct').classList.remove('hidden');
+    $('upload-box').classList.remove('hidden');
+    await refreshAccount();
+  } catch (e) { say($('who'), e.message, 'err'); }
+};
+
+// orders: show where to pay and wait for the payment
+function showOrder(order, title) {
+  const box = document.createElement('section');
+  box.className = 'order';
+  box.innerHTML = `<h2></h2><p>Send exactly <b class="amount"></b> sats on Arkade to:</p>
+    <p class="mono address"></p><p><a class="pay">Open in wallet</a></p><p class="status warn">Waiting for the payment…</p>`;
+  box.querySelector('h2').textContent = title;
+  box.querySelector('.amount').textContent = order.amount_sats;
+  box.querySelector('.address').textContent = order.payment.address;
+  box.querySelector('.pay').href = order.payment.uri;
+  $('orders').prepend(box);
+
+  const timer = setInterval(async () => {
+    try {
+      const o = await api('GET', '/api/orders/' + order.id);
+      if (o.status !== 'paid') return;
+      clearInterval(timer);
+      const gone = o.credits.filter((c) => c.result === 'gone').length;
+      const st = box.querySelector('.status');
+      say(st, gone ? `Paid, but ${gone} file(s) had expired already.` : 'Paid, thank you!', gone ? 'warn' : 'ok');
+      if (pubkey) refreshAccount();
+    } catch (e) { /* keep trying */ }
+  }, 3000);
+}
+
+$('credit-go').onclick = async () => {
+  try {
+    const order = await api('POST', '/api/account/credit', {
+      auth: await authHeader('account'),
+      body: { amount_sats: Number($('credit').value) },
+    });
+    showOrder(order, 'Add sats to your account');
+  } catch (e) { alert(e.message); }
+};
+
+$('upload-go').onclick = async () => {
+  const file = $('file').files[0];
+  if (!file) return;
+  const out = $('upload-out');
+  try {
+    say(out, 'Hashing…');
+    const buf = await file.arrayBuffer();
+    const hash = await sha256(buf);
+    say(out, 'Uploading…');
+    const res = await fetch('/upload', {
+      method: 'PUT',
+      headers: { authorization: await authHeader('upload', [hash]), 'content-type': file.type || 'application/octet-stream' },
+      body: buf,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || res.statusText);
+    out.className = 'ok';
+    out.innerHTML = '';
+    const a = Object.assign(document.createElement('a'), { href: data.url, textContent: data.url });
+    out.append('Stored: ', a);
+    addRow(data.sha256);
+    refreshAccount();
+  } catch (e) { say(out, e.message, 'err'); }
+};
+
+function addRow(hash = '') {
+  const row = document.createElement('div');
+  row.className = 'row';
+  row.innerHTML = '<div><label>sha256</label><input class="hash"></div><div class="narrow"><label>sats</label><input class="sats" type="number" min="1" value="100"></div>';
+  row.querySelector('.hash').value = hash;
+  $('fund-rows').append(row);
+}
+$('add-row').onclick = () => addRow();
+addRow();
+
+$('fund-go').onclick = async () => {
+  const files = {};
+  for (const row of $('fund-rows').children) {
+    const h = row.querySelector('.hash').value.trim().toLowerCase();
+    const s = Number(row.querySelector('.sats').value);
+    if (h) files[h] = (files[h] || 0) + s;
+  }
+  try {
+    const order = await api('POST', '/api/topup', { body: { files } });
+    say($('fund-out'), '');
+    showOrder(order, 'Keep ' + Object.keys(files).length + ' file(s) alive');
+  } catch (e) { say($('fund-out'), e.message, 'err'); }
+};
+
+$('lookup-go').onclick = async () => {
+  const out = $('lookup-out');
+  try {
+    const f = await api('GET', '/api/files/' + $('lookup').value.trim().toLowerCase());
+    say(out, f.expired
+      ? 'This file has expired.'
+      : `${f.size} bytes, ${f.balance_sats} sats left, costs ${f.rent_sats_per_day} sats/day → about ${f.days_left} days.`);
+  } catch (e) { say(out, e.message, 'err'); }
+};
+
+api('GET', '/api/info').then((i) => {
+  info = i;
+  const mib = (i.restrictions.max_file_size / 1048576).toFixed(0);
+  $('price').textContent = `Up to ${mib} MiB. Hosting costs ${i.pricing.base_sats_per_day} sat/day plus ${i.pricing.sats_per_mib_per_day} per MiB; new files are funded for at least ${i.pricing.min_days} days. First payment is at least ${i.restrictions.min_account_payment_sats} sats.`;
+  $('credit').value = i.restrictions.min_account_payment_sats;
+});
+</script>
+</body>
+</html>
