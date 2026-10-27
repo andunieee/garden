@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
 use super::*;
@@ -11,11 +11,20 @@ pub struct MemoryLedger {
 
 #[derive(Default)]
 struct State {
-    users: HashMap<PubKeyBytes, u64>,
+    users: HashMap<PubKeyBytes, User>,
     files: BTreeMap<u64, File>,
     by_hash: HashMap<Hash, u64>,
-    applied: HashSet<u128>,
+    /// transfer ids that were applied, with what they moved
+    applied: HashMap<u128, u64>,
     clock: u64,
+    totals: Totals,
+    conversions: Vec<(String, Conversion)>,
+    expenses: Vec<(String, Expense)>,
+}
+
+struct User {
+    balance: u64,
+    timestamp: u64,
 }
 
 struct File {
@@ -29,22 +38,37 @@ impl MemoryLedger {
     }
 }
 
+impl State {
+    fn tick(&mut self) -> u64 {
+        self.clock += 1;
+        self.clock
+    }
+}
+
 #[async_trait::async_trait]
 impl Ledger for MemoryLedger {
     async fn user(&self, pubkey: &PubKeyBytes) -> Result<Option<UserInfo>> {
         let st = self.state.lock().unwrap();
-        Ok(st.users.get(pubkey).map(|&balance| UserInfo {
+        Ok(st.users.get(pubkey).map(|u| UserInfo {
             pubkey: *pubkey,
-            balance,
+            balance: u.balance,
+            timestamp: u.timestamp,
         }))
     }
 
     async fn credit_user(&self, pubkey: &PubKeyBytes, sats: u64, payment_id: u128) -> Result<()> {
         let mut st = self.state.lock().unwrap();
-        let first_time = st.applied.insert(transfer_id(&[b"pay", &payment_id.to_be_bytes()]));
-        let balance = st.users.entry(*pubkey).or_insert(0);
+        let first_time = st
+            .applied
+            .insert(transfer_id(&[b"pay", &payment_id.to_be_bytes()]), sats)
+            .is_none();
+        if !st.users.contains_key(pubkey) {
+            let timestamp = st.tick();
+            st.users.insert(*pubkey, User { balance: 0, timestamp });
+        }
         if first_time {
-            *balance += sats;
+            st.users.get_mut(pubkey).unwrap().balance += sats;
+            st.totals.received += sats;
         }
         Ok(())
     }
@@ -69,8 +93,8 @@ impl Ledger for MemoryLedger {
             return Err(LedgerError::FileExists);
         }
 
-        let balance = st.users.get_mut(uploader).ok_or(LedgerError::NoSuchAccount)?;
-        *balance = balance.checked_sub(funding).ok_or(LedgerError::InsufficientBalance)?;
+        let user = st.users.get_mut(uploader).ok_or(LedgerError::NoSuchAccount)?;
+        user.balance = user.balance.checked_sub(funding).ok_or(LedgerError::InsufficientBalance)?;
 
         match st.by_hash.get(hash).copied() {
             Some(ts) => {
@@ -80,8 +104,7 @@ impl Ledger for MemoryLedger {
                 f.uploaders.push(*uploader);
             }
             None => {
-                st.clock += 1;
-                let ts = st.clock;
+                let ts = st.tick();
                 st.by_hash.insert(*hash, ts);
                 st.files.insert(
                     ts,
@@ -110,10 +133,12 @@ impl Ledger for MemoryLedger {
         if st.files[&ts].info.closed {
             return Ok(Credited::NoSuchFile);
         }
-        if !st.applied.insert(transfer_id(&[b"topup", &payment_id.to_be_bytes(), hash])) {
+        let id = transfer_id(&[b"topup", &payment_id.to_be_bytes(), hash]);
+        if st.applied.insert(id, sats).is_some() {
             return Ok(Credited::AlreadyDone);
         }
         st.files.get_mut(&ts).unwrap().info.balance += sats;
+        st.totals.received += sats;
         Ok(Credited::Yes)
     }
 
@@ -122,14 +147,18 @@ impl Ledger for MemoryLedger {
         let Some(&ts) = st.by_hash.get(hash) else {
             return Err(LedgerError::NoSuchAccount);
         };
-        let seen = !st.applied.insert(transfer_id(&[b"rent", &charge_id.to_be_bytes(), hash]));
-        let f = st.files.get_mut(&ts).unwrap();
-        if seen {
-            // like the real thing, repeating the charge reports what was taken the first time
-            return Ok(sats);
+        let id = transfer_id(&[b"rent", &charge_id.to_be_bytes(), hash]);
+        if let Some(taken) = st.applied.get(&id) {
+            // like the real thing, repeating a charge reports what was taken the first time
+            return Ok(*taken);
         }
+        let f = st.files.get_mut(&ts).unwrap();
         let taken = sats.min(f.info.balance);
         f.info.balance -= taken;
+        if taken > 0 {
+            st.applied.insert(id, taken);
+            st.totals.earned += taken;
+        }
         Ok(taken)
     }
 
@@ -167,6 +196,103 @@ impl Ledger for MemoryLedger {
             .take(limit)
             .map(|(_, f)| f.info.clone())
             .collect())
+    }
+
+    async fn list_users(&self, since: u64, limit: usize) -> Result<Vec<UserInfo>> {
+        let st = self.state.lock().unwrap();
+        let mut users: Vec<_> = st
+            .users
+            .iter()
+            .filter(|(_, u)| u.timestamp >= since)
+            .map(|(pk, u)| UserInfo {
+                pubkey: *pk,
+                balance: u.balance,
+                timestamp: u.timestamp,
+            })
+            .collect();
+        users.sort_by_key(|u| u.timestamp);
+        users.truncate(limit);
+        Ok(users)
+    }
+
+    async fn totals(&self) -> Result<Totals> {
+        Ok(self.state.lock().unwrap().totals)
+    }
+
+    async fn record_unclaimed(&self, sats: u64, id: u128) -> Result<()> {
+        let mut st = self.state.lock().unwrap();
+        if sats > 0 && st.applied.insert(transfer_id(&[b"unclaimed", &id.to_be_bytes()]), sats).is_none() {
+            st.totals.received += sats;
+            st.totals.unclaimed += sats;
+        }
+        Ok(())
+    }
+
+    async fn record_conversion(&self, reference: &str, sats: u64, fiat_minor: u64) -> Result<bool> {
+        let mut st = self.state.lock().unwrap();
+        if let Some((_, c)) = st.conversions.iter().find(|(r, _)| r == reference) {
+            return if (c.sats, c.fiat_minor) == (sats, fiat_minor) {
+                Ok(false)
+            } else {
+                Err(LedgerError::ReferenceReused)
+            };
+        }
+        let timestamp = st.tick();
+        st.conversions.push((
+            reference.to_string(),
+            Conversion {
+                sats,
+                fiat_minor,
+                timestamp,
+                reference: reference_id(reference),
+            },
+        ));
+        st.totals.sold += sats;
+        st.totals.fiat_in += fiat_minor;
+        Ok(true)
+    }
+
+    async fn record_expense(&self, provider: u32, reference: &str, amount_minor: u64, date: u64) -> Result<bool> {
+        let mut st = self.state.lock().unwrap();
+        if let Some((_, e)) = st
+            .expenses
+            .iter()
+            .find(|(r, e)| r == reference && e.provider == provider)
+        {
+            return if (e.amount_minor, e.date) == (amount_minor, date) {
+                Ok(false)
+            } else {
+                Err(LedgerError::ReferenceReused)
+            };
+        }
+        let timestamp = st.tick();
+        st.expenses.push((
+            reference.to_string(),
+            Expense {
+                provider,
+                amount_minor,
+                date,
+                timestamp,
+                reference: reference_id(reference),
+            },
+        ));
+        st.totals.fiat_out += amount_minor;
+        Ok(true)
+    }
+
+    async fn expenses(&self, provider: u32) -> Result<Vec<Expense>> {
+        let st = self.state.lock().unwrap();
+        Ok(st
+            .expenses
+            .iter()
+            .filter(|(_, e)| e.provider == provider)
+            .map(|(_, e)| e.clone())
+            .collect())
+    }
+
+    async fn conversions(&self) -> Result<Vec<Conversion>> {
+        let st = self.state.lock().unwrap();
+        Ok(st.conversions.iter().map(|(_, c)| c.clone()).collect())
     }
 }
 

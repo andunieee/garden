@@ -14,7 +14,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::app::{App, AppError, parse_hash, parse_pubkey};
+use crate::app::{App, AppError, parse_hash};
 use crate::store::{Order, OrderStatus};
 
 type Shared = State<Arc<App>>;
@@ -64,12 +64,8 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/topup", post(topup))
         .route("/api/orders/{id}", get(order))
         .route("/api/files/{hash}", get(file))
-        // moderation
-        .route("/admin/files/{hash}", get(admin_file))
-        .route("/admin/ban", post(admin_ban))
-        .route("/admin/bans", get(admin_bans))
-        .route("/admin/sweep", post(admin_sweep))
-        .route("/admin/orders/{id}/confirm", post(admin_confirm))
+        // everything the operator does happens here, in hyperb
+        .merge(crate::operator::transport::routes())
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
@@ -78,6 +74,7 @@ pub fn router(app: Arc<App>) -> Router {
                 .expose_headers([
                     header::LOCATION,
                     header::HeaderName::from_static("x-reason"),
+                    header::HeaderName::from_static("hyperb-session"),
                 ]),
         )
         .with_state(app)
@@ -108,25 +105,6 @@ fn auth(app: &App, headers: &HeaderMap, verb: Verb) -> Result<Auth> {
 
 fn pubkey_of(auth: &Auth) -> [u8; 32] {
     auth.pubkey().0
-}
-
-fn is_admin(app: &App, headers: &HeaderMap) -> Result<()> {
-    let token = &app.config.admin_token;
-    if token.is_empty() {
-        return Err(AppError::NotFound("the admin api is disabled".into()));
-    }
-    let given = header_str(headers, "authorization")
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .unwrap_or("");
-
-    // compare without stopping at the first difference
-    let same = given.len() == token.len()
-        && given.bytes().zip(token.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0;
-    if same {
-        Ok(())
-    } else {
-        Err(AppError::Unauthorized("wrong admin token".into()))
-    }
 }
 
 // blossom
@@ -248,73 +226,4 @@ async fn order(State(app): Shared, Path(id): Path<String>) -> Result<Json<Order>
 async fn file(State(app): Shared, Path(hash): Path<String>) -> Result<Response> {
     let hash = parse_hash(&hash.to_lowercase()).ok_or_else(|| AppError::BadRequest("not a sha256".into()))?;
     Ok(Json(app.file_view(&hash).await?).into_response())
-}
-
-// moderation
-
-async fn admin_file(State(app): Shared, headers: HeaderMap, Path(hash): Path<String>) -> Result<Response> {
-    is_admin(&app, &headers)?;
-    let hash = parse_hash(&hash.to_lowercase()).ok_or_else(|| AppError::BadRequest("not a sha256".into()))?;
-    Ok(Json(json!({
-        "file": app.file_view(&hash).await.ok(),
-        "uploaders": app.uploaders(&hash).await?,
-        "banned": app.store.is_hash_banned(&lowercase_hex::encode(hash))?,
-    }))
-    .into_response())
-}
-
-#[derive(Deserialize)]
-struct BanRequest {
-    pubkey: Option<String>,
-    sha256: Option<String>,
-    /// with a pubkey: also remove everything it uploaded
-    #[serde(default)]
-    purge: bool,
-}
-
-async fn admin_ban(State(app): Shared, headers: HeaderMap, Json(req): Json<BanRequest>) -> Result<Response> {
-    is_admin(&app, &headers)?;
-    let mut purged = vec![];
-    if let Some(pk) = &req.pubkey {
-        let pk = parse_pubkey(pk).ok_or_else(|| AppError::BadRequest("not a pubkey in hex".into()))?;
-        purged = app.ban_pubkey(&pk, req.purge).await?;
-    }
-    if let Some(h) = &req.sha256 {
-        let h = parse_hash(&h.to_lowercase()).ok_or_else(|| AppError::BadRequest("not a sha256".into()))?;
-        app.purge_file(&h).await?;
-        purged.push(lowercase_hex::encode(h));
-    }
-    if req.pubkey.is_none() && req.sha256.is_none() {
-        return Err(AppError::BadRequest("give a pubkey or a sha256".into()));
-    }
-    Ok(Json(json!({ "purged": purged })).into_response())
-}
-
-async fn admin_bans(State(app): Shared, headers: HeaderMap) -> Result<Response> {
-    is_admin(&app, &headers)?;
-    Ok(Json(json!({
-        "pubkeys": app.store.banned_pubkeys()?,
-        "hashes": app.store.banned_hashes()?,
-    }))
-    .into_response())
-}
-
-/// run the daily charge now. harmless to repeat, each file pays once per day.
-async fn admin_sweep(State(app): Shared, headers: HeaderMap) -> Result<Response> {
-    is_admin(&app, &headers)?;
-    Ok(Json(app.sweep(crate::app::now() / 86400).await?).into_response())
-}
-
-/// with mock payments only: pretend the order was paid
-async fn admin_confirm(State(app): Shared, headers: HeaderMap, Path(id): Path<String>) -> Result<Response> {
-    is_admin(&app, &headers)?;
-    let order = (id.len() == 32)
-        .then(|| app.store.order(&id))
-        .transpose()?
-        .flatten()
-        .ok_or_else(|| AppError::NotFound("no such order".into()))?;
-    if !app.payments.simulate(&order.payment, order.amount_sats) {
-        return Err(AppError::BadRequest("payments are real, they can't be confirmed by hand".into()));
-    }
-    Ok(Json(app.check_order(order).await?).into_response())
 }

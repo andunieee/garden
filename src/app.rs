@@ -58,6 +58,7 @@ impl From<LedgerError> for AppError {
                 AppError::PaymentRequired("not enough sats in your account".into())
             }
             LedgerError::NoSuchAccount => AppError::PaymentRequired("you don't have an account yet".into()),
+            LedgerError::ReferenceReused => AppError::BadRequest(e.to_string()),
             e => {
                 log::error!("{e}");
                 AppError::Internal("something went wrong on our side".into())
@@ -110,6 +111,9 @@ pub struct App {
     locks: DashMap<Hash, Arc<tokio::sync::Mutex<()>>>,
     /// a short memory of which files exist, so serving doesn't hit the ledger every time
     pub(crate) served: DashMap<Hash, (Instant, Option<FileInfo>)>,
+    /// bytes of the files people were sent to fetch, by day and provider, not saved yet
+    redirected: DashMap<(u64, u32), u64>,
+    pub(crate) sessions: crate::operator::transport::Sessions,
 }
 
 const SERVED_CACHE: Duration = Duration::from_secs(30);
@@ -154,6 +158,8 @@ impl App {
             store,
             locks: DashMap::new(),
             served: DashMap::new(),
+            redirected: DashMap::new(),
+            sessions: Default::default(),
         })
     }
 
@@ -244,6 +250,7 @@ impl App {
             kind,
             amount_sats,
             status: OrderStatus::Pending,
+            received_sats: None,
             credits: vec![],
         };
         self.store.put_order(&order)?;
@@ -263,7 +270,11 @@ impl App {
             log::warn!("order {} was overpaid: {received} instead of {}", order.id, order.amount_sats);
         }
 
-        // everything below can be repeated safely: the ledger applies each order once
+        // everything below can be repeated safely: the ledger applies each order once.
+        // what was paid and not used goes to the suspense account, so that the ledger keeps
+        // matching the wallet.
+        let mut unclaimed = received - order.amount_sats;
+        order.received_sats = Some(received);
         match &order.kind {
             OrderKind::Account { pubkey } => {
                 let pubkey = parse_pubkey(pubkey).expect("validated when the order was created");
@@ -278,7 +289,8 @@ impl App {
                     let result = match self.ledger.credit_file(&parsed, sats, order.payment_id()).await? {
                         Credited::Yes | Credited::AlreadyDone => "credited",
                         Credited::NoSuchFile => {
-                            log::warn!("order {}: {hash} is gone, {sats} sats go nowhere", order.id);
+                            log::warn!("order {}: {hash} is gone, {sats} sats are unclaimed", order.id);
+                            unclaimed += sats;
                             "gone"
                         }
                     };
@@ -291,6 +303,7 @@ impl App {
                 order.credits = credits;
             }
         }
+        self.ledger.record_unclaimed(unclaimed, order.payment_id()).await?;
 
         order.status = OrderStatus::Paid;
         self.store.put_order(&order)?;
@@ -347,11 +360,24 @@ impl App {
             .providers
             .get(file.provider)
             .ok_or_else(|| AppError::Unavailable("the provider of this file is not configured".into()))?;
-        storage
+        let url = storage
             .url(&hex(hash))
             .await
-            .map(Some)
-            .map_err(|e| AppError::Unavailable(e.to_string()))
+            .map_err(|e| AppError::Unavailable(e.to_string()))?;
+        *self.redirected.entry((now() / 86400, file.provider)).or_default() += file.size;
+        Ok(Some(url))
+    }
+
+    /// save the redirect counters, so that they survive and the audit sees them
+    pub fn save_redirects(&self) {
+        let keys: Vec<_> = self.redirected.iter().map(|e| *e.key()).collect();
+        for key in keys {
+            if let Some((_, bytes)) = self.redirected.remove(&key)
+                && let Err(e) = self.store.add_redirected(key.0, key.1, bytes)
+            {
+                log::error!("{e}");
+            }
+        }
     }
 
     pub fn descriptor(&self, hash_hex: &str, size: u64, mime: &str, uploaded: u64) -> BlobDescriptor {
@@ -461,6 +487,8 @@ impl App {
             files: files.len(),
             ..Default::default()
         };
+        // provider -> (files, bytes, sats of rent)
+        let mut by_provider: std::collections::BTreeMap<u32, (u64, u64, u64)> = Default::default();
         for f in files {
             let lock = self.lock(&f.hash);
             let _guard = lock.lock().await;
@@ -474,6 +502,8 @@ impl App {
                 }
             };
             report.charged_sats += taken;
+            let p = by_provider.entry(f.provider).or_default();
+            *p = (p.0 + 1, p.1 + f.size, p.2 + taken);
 
             match self.ledger.file(&f.hash).await {
                 Ok(Some(after)) if !after.closed && after.balance == 0 => {
@@ -487,6 +517,9 @@ impl App {
                 Ok(_) => {}
                 Err(e) => log::error!("{e}"),
             }
+        }
+        for (provider, (files, bytes, rent)) in by_provider {
+            self.store.record_sweep(day, provider, files, bytes, rent)?;
         }
         Ok(report)
     }
@@ -532,6 +565,90 @@ impl App {
         }
     }
 
+    // the books
+
+    fn check_provider(&self, provider: u32) -> Result<()> {
+        if self.config.providers.iter().any(|p| p.id == provider) {
+            Ok(())
+        } else {
+            Err(AppError::BadRequest(format!("there is no provider {provider}")))
+        }
+    }
+
+    /// the operator paid a provider's bill. false if it was already recorded.
+    pub async fn record_expense(
+        &self,
+        provider: u32,
+        reference: &str,
+        amount_minor: u64,
+        date: u64,
+        note: &str,
+    ) -> Result<bool> {
+        self.check_provider(provider)?;
+        let reference = reference.trim();
+        if reference.is_empty() {
+            return Err(AppError::BadRequest("a reference is needed, like the number of the invoice".into()));
+        }
+        if amount_minor == 0 {
+            return Err(AppError::BadRequest("the amount can't be zero".into()));
+        }
+        let recorded = self.ledger.record_expense(provider, reference, amount_minor, date).await?;
+        if recorded {
+            self.store.set_note(&ledger::reference_hex(reference), &label(reference, note))?;
+        }
+        Ok(recorded)
+    }
+
+    /// the operator sold sats for fiat. false if it was already recorded.
+    pub async fn record_conversion(
+        &self,
+        reference: &str,
+        sats: u64,
+        fiat_minor: u64,
+        note: &str,
+    ) -> Result<bool> {
+        let reference = reference.trim();
+        if reference.is_empty() {
+            return Err(AppError::BadRequest("a reference is needed, like the id of the trade".into()));
+        }
+        if sats == 0 || fiat_minor == 0 {
+            return Err(AppError::BadRequest("the amounts can't be zero".into()));
+        }
+        let recorded = self.ledger.record_conversion(reference, sats, fiat_minor).await?;
+        if recorded {
+            self.store.set_note(&ledger::reference_hex(reference), &label(reference, note))?;
+        }
+        Ok(recorded)
+    }
+
+    pub fn set_rate(&self, fiat_minor_per_btc: u64) -> Result<()> {
+        if fiat_minor_per_btc == 0 {
+            return Err(AppError::BadRequest("the rate can't be zero".into()));
+        }
+        Ok(self.store.set_rate(crate::store::Rate {
+            fiat_minor_per_btc,
+            set_at: now(),
+        })?)
+    }
+
+    pub fn set_prices(&self, provider: u32, prices: crate::store::ProviderPrices) -> Result<()> {
+        self.check_provider(provider)?;
+        Ok(self.store.set_prices(provider, prices)?)
+    }
+
+    /// with mock payments only: pretend an order was paid
+    pub async fn confirm_mock(&self, order_id: &str) -> Result<Order> {
+        let order = (order_id.len() == 32)
+            .then(|| self.store.order(order_id))
+            .transpose()?
+            .flatten()
+            .ok_or_else(|| AppError::NotFound("no such order".into()))?;
+        if !self.payments.simulate(&order.payment, order.amount_sats) {
+            return Err(AppError::BadRequest("payments are real, they can't be confirmed by hand".into()));
+        }
+        self.check_order(order).await
+    }
+
     // moderation
 
     /// who put this file here?
@@ -569,6 +686,14 @@ impl App {
             }
         }
         Ok(purged)
+    }
+}
+
+/// what we show next to an entry of the books
+fn label(reference: &str, note: &str) -> String {
+    match note.trim() {
+        "" => reference.to_string(),
+        note => format!("{reference} — {note}"),
     }
 }
 

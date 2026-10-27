@@ -19,6 +19,13 @@ const BANNED_HASHES: TableDefinition<&str, u64> = TableDefinition::new("banned_h
 /// hash -> provider
 const PENDING_DELETES: TableDefinition<&str, u32> = TableDefinition::new("pending_deletes");
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
+/// things the operator tells us: the price of bitcoin, what providers charge
+const SETTINGS: TableDefinition<&str, &str> = TableDefinition::new("settings");
+/// "<day>:<provider>" -> [DayStats]
+const DAILY: TableDefinition<&str, &str> = TableDefinition::new("daily");
+/// what the operator wrote next to an entry of the books, by the reference's id in hex. the
+/// amounts themselves are in the ledger.
+const NOTES: TableDefinition<&str, &str> = TableDefinition::new("notes");
 
 #[derive(thiserror::Error, Debug)]
 #[error("local storage failure: {0}")]
@@ -65,6 +72,9 @@ pub struct Order {
     pub amount_sats: u64,
     pub status: OrderStatus,
     pub payment: PaymentRequest,
+    /// what had arrived when the order was settled, which can be more than was asked
+    #[serde(default)]
+    pub received_sats: Option<u64>,
     /// filled when the order is paid, for file orders
     #[serde(default)]
     pub credits: Vec<FileCredit>,
@@ -75,6 +85,33 @@ impl Order {
     pub fn payment_id(&self) -> u128 {
         u128::from_str_radix(&self.id, 16).unwrap_or(0)
     }
+}
+
+/// what the operator says bitcoin is worth
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct Rate {
+    /// minor units of fiat for 1 BTC
+    pub fiat_minor_per_btc: u64,
+    pub set_at: u64,
+}
+
+/// what a provider charges, in minor units of fiat. both are optional.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+pub struct ProviderPrices {
+    pub storage_per_gb_month_minor: f64,
+    pub egress_per_gb_minor: f64,
+}
+
+/// what happened with a provider in a day
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DayStats {
+    /// files charged rent that day, and their size
+    pub files: u64,
+    pub bytes: u64,
+    /// sats the rent brought in
+    pub rent_sats: u64,
+    /// size of the files people were sent to fetch, which is as close as we get to egress
+    pub redirected_bytes: u64,
 }
 
 pub struct Store {
@@ -101,6 +138,9 @@ impl Store {
         tx.open_table(BANNED_HASHES)?;
         tx.open_table(PENDING_DELETES)?;
         tx.open_table(META)?;
+        tx.open_table(SETTINGS)?;
+        tx.open_table(DAILY)?;
+        tx.open_table(NOTES)?;
         tx.commit()?;
         Ok(Self { db })
     }
@@ -219,6 +259,99 @@ impl Store {
         Ok(out)
     }
 
+    fn setting<T: for<'de> Deserialize<'de>>(&self, key: &str) -> Result<Option<T>> {
+        let tx = self.db.begin_read()?;
+        let table = tx.open_table(SETTINGS)?;
+        Ok(table
+            .get(key)?
+            .and_then(|v| serde_json::from_str(v.value()).ok()))
+    }
+
+    fn set_setting<T: Serialize>(&self, key: &str, value: &T) -> Result<()> {
+        let json = serde_json::to_string(value).expect("settings always serialize");
+        let tx = self.db.begin_write()?;
+        tx.open_table(SETTINGS)?.insert(key, json.as_str())?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn rate(&self) -> Result<Option<Rate>> {
+        self.setting("rate")
+    }
+
+    pub fn set_rate(&self, rate: Rate) -> Result<()> {
+        self.set_setting("rate", &rate)
+    }
+
+    pub fn prices(&self, provider: u32) -> Result<Option<ProviderPrices>> {
+        self.setting(&format!("prices:{provider}"))
+    }
+
+    pub fn set_prices(&self, provider: u32, prices: ProviderPrices) -> Result<()> {
+        self.set_setting(&format!("prices:{provider}"), &prices)
+    }
+
+    pub fn note(&self, reference_hex: &str) -> Result<Option<String>> {
+        let tx = self.db.begin_read()?;
+        Ok(tx.open_table(NOTES)?.get(reference_hex)?.map(|v| v.value().to_string()))
+    }
+
+    pub fn set_note(&self, reference_hex: &str, note: &str) -> Result<()> {
+        let tx = self.db.begin_write()?;
+        tx.open_table(NOTES)?.insert(reference_hex, note)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn update_day(&self, day: u64, provider: u32, change: impl FnOnce(&mut DayStats)) -> Result<()> {
+        let key = format!("{day:010}:{provider:010}");
+        let tx = self.db.begin_write()?;
+        {
+            let mut table = tx.open_table(DAILY)?;
+            let mut stats: DayStats = table
+                .get(key.as_str())?
+                .and_then(|v| serde_json::from_str(v.value()).ok())
+                .unwrap_or_default();
+            change(&mut stats);
+            let json = serde_json::to_string(&stats).expect("stats always serialize");
+            table.insert(key.as_str(), json.as_str())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// what the daily sweep saw. sweeping a day twice keeps the bigger numbers, since the
+    /// second time files that ran out in the first are gone.
+    pub fn record_sweep(&self, day: u64, provider: u32, files: u64, bytes: u64, rent_sats: u64) -> Result<()> {
+        self.update_day(day, provider, |s| {
+            s.files = s.files.max(files);
+            s.bytes = s.bytes.max(bytes);
+            s.rent_sats = s.rent_sats.max(rent_sats);
+        })
+    }
+
+    pub fn add_redirected(&self, day: u64, provider: u32, bytes: u64) -> Result<()> {
+        self.update_day(day, provider, |s| s.redirected_bytes += bytes)
+    }
+
+    /// every provider's stats for the days from `from` to `to`, both included
+    pub fn day_stats(&self, from: u64, to: u64) -> Result<Vec<(u64, u32, DayStats)>> {
+        let tx = self.db.begin_read()?;
+        let table = tx.open_table(DAILY)?;
+        let (lo, hi) = (format!("{from:010}:"), format!("{:010}:", to + 1));
+        let mut out = vec![];
+        for entry in table.range(lo.as_str()..hi.as_str())? {
+            let (k, v) = entry?;
+            let Some((day, provider)) = k.value().split_once(':') else { continue };
+            if let (Ok(day), Ok(provider), Ok(stats)) =
+                (day.parse(), provider.parse(), serde_json::from_str(v.value()))
+            {
+                out.push((day, provider, stats));
+            }
+        }
+        Ok(out)
+    }
+
     pub fn meta(&self, key: &str) -> Result<Option<u64>> {
         let tx = self.db.begin_read()?;
         Ok(tx.open_table(META)?.get(key)?.map(|v| v.value()))
@@ -248,6 +381,7 @@ mod tests {
                 address: "mock:x".into(),
                 uri: "mock:x".into(),
             },
+            received_sats: None,
             credits: vec![],
         }
     }
@@ -264,6 +398,38 @@ mod tests {
         assert!(store.waiting_orders(50).unwrap().is_empty());
         assert_eq!(store.order("a").unwrap().unwrap().status, OrderStatus::Paid);
         assert!(store.order("zzz").unwrap().is_none());
+    }
+
+    #[test]
+    fn settings_notes_and_stats() {
+        let store = Store::temporary().unwrap();
+        assert_eq!(store.rate().unwrap(), None);
+        store.set_rate(Rate { fiat_minor_per_btc: 6_000_000, set_at: 5 }).unwrap();
+        assert_eq!(store.rate().unwrap().unwrap().fiat_minor_per_btc, 6_000_000);
+
+        assert_eq!(store.prices(1).unwrap(), None);
+        let prices = ProviderPrices { storage_per_gb_month_minor: 0.6, egress_per_gb_minor: 1.0 };
+        store.set_prices(1, prices).unwrap();
+        assert_eq!(store.prices(1).unwrap(), Some(prices));
+        assert_eq!(store.prices(2).unwrap(), None);
+
+        store.set_note("ab", "march invoice").unwrap();
+        assert_eq!(store.note("ab").unwrap().as_deref(), Some("march invoice"));
+
+        // the sweep of a day can be repeated, redirects add up
+        store.record_sweep(10, 1, 3, 300, 30).unwrap();
+        store.record_sweep(10, 1, 2, 200, 20).unwrap();
+        store.add_redirected(10, 1, 7).unwrap();
+        store.add_redirected(10, 1, 8).unwrap();
+        store.record_sweep(11, 1, 1, 100, 10).unwrap();
+        store.record_sweep(11, 2, 1, 50, 5).unwrap();
+        store.record_sweep(12, 1, 1, 100, 10).unwrap();
+
+        let stats = store.day_stats(10, 11).unwrap();
+        assert_eq!(stats.len(), 3);
+        assert_eq!(stats[0], (10, 1, DayStats { files: 3, bytes: 300, rent_sats: 30, redirected_bytes: 15 }));
+        assert_eq!((stats[1].0, stats[1].1, stats[2].0, stats[2].1), (11, 1, 11, 2));
+        assert_eq!(store.day_stats(0, 9).unwrap().len(), 0);
     }
 
     #[test]

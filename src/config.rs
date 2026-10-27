@@ -18,9 +18,15 @@ pub struct Config {
     #[serde(default = "default_data_dir")]
     pub data_dir: String,
 
-    /// bearer token for the /admin endpoints, if empty these are disabled
+    /// public keys (hex, ed25519) allowed into the operator interface, which is a hyperb app
+    /// at /operator. if empty the interface is disabled. a key that tries and isn't here is
+    /// written to the log, so it's easy to copy.
     #[serde(default)]
-    pub admin_token: String,
+    pub operators: Vec<String>,
+
+    /// the money the operator pays the providers with
+    #[serde(default)]
+    pub fiat: Fiat,
 
     #[serde(default)]
     pub restrictions: Restrictions,
@@ -42,6 +48,76 @@ fn default_listen() -> String {
 
 fn default_data_dir() -> String {
     "./data".into()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Fiat {
+    /// only for display, e.g. "USD"
+    pub currency: String,
+    /// digits after the decimal mark: amounts are kept in units of 1/10^decimals
+    pub decimals: u32,
+}
+
+impl Default for Fiat {
+    fn default() -> Self {
+        Self {
+            currency: "USD".into(),
+            decimals: 2,
+        }
+    }
+}
+
+impl Fiat {
+    fn unit(&self) -> f64 {
+        10f64.powi(self.decimals as i32)
+    }
+
+    /// "12.34" (or "12,34", or "$1,200") as a number
+    fn number(text: &str) -> Option<f64> {
+        let t: String = text
+            .chars()
+            .filter(|c| !c.is_whitespace() && !"$€£¥".contains(*c))
+            .collect();
+        let lone_decimal_comma =
+            t.matches(',').count() == 1 && !t.contains('.') && t.rsplit(',').next()?.len() != 3;
+        let t = if lone_decimal_comma { t.replace(',', ".") } else { t.replace(',', "") };
+        t.parse::<f64>().ok().filter(|v| *v >= 0.0 && *v < 1e12)
+    }
+
+    /// an amount of money in minor units
+    pub fn parse(&self, text: &str) -> Option<u64> {
+        Some((Self::number(text)? * self.unit()).round() as u64)
+    }
+
+    /// a price, which can be a fraction of a minor unit (0.6 cents per GB)
+    pub fn parse_price(&self, text: &str) -> Option<f64> {
+        Some(Self::number(text)? * self.unit())
+    }
+
+    pub fn format(&self, minor: i64) -> String {
+        let unit = 10u64.pow(self.decimals);
+        let abs = minor.unsigned_abs();
+        let whole = (abs / unit).to_string();
+        let mut grouped = String::new();
+        for (i, c) in whole.chars().enumerate() {
+            if i > 0 && (whole.len() - i) % 3 == 0 {
+                grouped.push(',');
+            }
+            grouped.push(c);
+        }
+        let sign = if minor < 0 { "-" } else { "" };
+        if self.decimals == 0 {
+            format!("{sign}{grouped} {}", self.currency)
+        } else {
+            format!("{sign}{grouped}.{:0w$} {}", abs % unit, self.currency, w = self.decimals as usize)
+        }
+    }
+
+    /// minor units to a number of whole units, for rates and prices
+    pub fn to_units(&self, minor: f64) -> f64 {
+        minor / self.unit()
+    }
 }
 
 /// who can do what. this is the place to add new rules, they are all enforced by
@@ -204,7 +280,7 @@ pub enum PaymentsConfig {
         #[serde(default = "default_poll_secs")]
         poll_secs: u64,
     },
-    /// payments are confirmed manually through the admin api, for development only
+    /// orders are marked as paid by hand in the operator interface, for development only
     Mock,
 }
 
@@ -273,6 +349,14 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        for key in &self.operators {
+            if key.len() != 64 || lowercase_hex::decode(key).is_err() {
+                return Err(format!("operator key {key:?} must be 32 bytes in hex"));
+            }
+        }
+        if self.fiat.decimals > 8 {
+            return Err("fiat.decimals is too big".into());
+        }
         if self.pricing.min_days < 30 {
             return Err("pricing.min_days can't be less than 30".into());
         }
@@ -343,6 +427,20 @@ mod tests {
         assert_eq!(p.rent_per_day(100 * 1024 * 1024), 11);
         // always at least a month, plus the day that is charged straight away
         assert_eq!(p.initial_funding(1024), 2 * 31);
+    }
+
+    #[test]
+    fn fiat_amounts() {
+        let f = Fiat::default();
+        assert_eq!(f.parse("12.50"), Some(1250));
+        assert_eq!(f.parse(" $1,200 "), Some(120000));
+        assert_eq!(f.parse("12,5"), Some(1250));
+        assert_eq!(f.parse("1,234.56"), Some(123456));
+        assert_eq!(f.parse("-3"), None);
+        assert_eq!(f.parse("abc"), None);
+        assert_eq!(f.format(123456), "1,234.56 USD");
+        assert_eq!(f.format(-5), "-0.05 USD");
+        assert_eq!(Fiat { currency: "JPY".into(), decimals: 0 }.format(1234567), "1,234,567 JPY");
     }
 
     #[test]

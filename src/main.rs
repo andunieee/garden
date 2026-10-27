@@ -1,7 +1,9 @@
 mod app;
+mod audit;
 mod config;
 mod http;
 mod ledger;
+mod operator;
 mod payments;
 mod storage;
 mod store;
@@ -34,7 +36,7 @@ async fn build(config: Config) -> Result<Arc<App>, String> {
             Arc::new(payments::arkade::Arkade::connect(server_url, seed, store.clone()).await.map_err(|e| e.to_string())?)
         }
         PaymentsConfig::Mock => {
-            log::warn!("payments are fake, confirm them through the admin api");
+            log::warn!("payments are fake, mark orders as paid in the operator interface");
             Arc::new(payments::MockPayments::default())
         }
     };
@@ -72,6 +74,7 @@ async fn collect_rent(app: Arc<App>) {
             }
         }
         app.retry_deletes().await;
+        app.save_redirects();
     }
 }
 

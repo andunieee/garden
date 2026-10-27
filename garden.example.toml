@@ -4,8 +4,15 @@ listen = "0.0.0.0:3000"
 public_url = "https://cdn.example.com"
 data_dir = "./data"
 
-# bearer token for /admin/*, leave empty to disable the admin api
-admin_token = "change-me"
+# who can use the operator interface: public keys (hex) of hyperb identities. open
+# hyperb://<your server>/operator in hyperb. a key that tries and isn't listed is written to
+# the log. leave empty to disable the interface.
+operators = []
+
+# the money you pay the providers with, for the books and the audit
+[fiat]
+currency = "USD"
+decimals = 2
 
 [restrictions]
 max_file_size = 104857600            # 100 MiB
@@ -37,7 +44,7 @@ server_url = "https://arkade.computer"
 # controls the money received, back it up.
 seed = "0000000000000000000000000000000000000000000000000000000000000001"
 poll_secs = 5
-# kind = "mock"     # development only, orders are confirmed through /admin/orders/<id>/confirm
+# kind = "mock"     # development only, orders are marked as paid in the operator interface
 
 # file hosting providers. new files go to a random enabled one (by weight), and each file is
 # served from the provider it was uploaded to. never change or reuse an `id`.

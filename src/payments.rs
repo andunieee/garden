@@ -36,6 +36,12 @@ pub trait Payments: Send + Sync {
     /// total sats that arrived at a request so far
     async fn received(&self, request: &PaymentRequest) -> Result<u64, PaymentError>;
 
+    /// everything the wallet holds right now, if we can tell. this is what the audit checks the
+    /// ledger against.
+    async fn wallet_balance(&self) -> Result<Option<u64>, PaymentError> {
+        Ok(None)
+    }
+
     /// pretend that money arrived. only the mock supports this.
     fn simulate(&self, _request: &PaymentRequest, _sats: u64) -> bool {
         false
@@ -47,6 +53,9 @@ pub type SharedPayments = Arc<dyn Payments>;
 #[derive(Default)]
 pub struct MockPayments {
     received: Mutex<HashMap<String, u64>>,
+    /// sats the operator took out of the wallet
+    #[allow(dead_code)]
+    pub spent: Mutex<u64>,
 }
 
 #[async_trait::async_trait]
@@ -62,6 +71,11 @@ impl Payments for MockPayments {
 
     async fn received(&self, request: &PaymentRequest) -> Result<u64, PaymentError> {
         Ok(*self.received.lock().unwrap().get(&request.address).unwrap_or(&0))
+    }
+
+    async fn wallet_balance(&self) -> Result<Option<u64>, PaymentError> {
+        let total: u64 = self.received.lock().unwrap().values().sum();
+        Ok(Some(total.saturating_sub(*self.spent.lock().unwrap())))
     }
 
     fn simulate(&self, request: &PaymentRequest, sats: u64) -> bool {
@@ -242,6 +256,11 @@ pub mod arkade {
                 .map_err(err)?;
             // spent ones count, whatever was received once was received
             Ok(vtxos.all().map(|v| v.amount.to_sat()).sum())
+        }
+
+        async fn wallet_balance(&self) -> Result<Option<u64>, PaymentError> {
+            let balance = self.client.offchain_balance().await.map_err(err)?;
+            Ok(Some(balance.total().to_sat()))
         }
     }
 }

@@ -20,14 +20,21 @@ impl TigerBeetleLedger {
             client: tb::Client::new(cluster_id as u128, addresses).map_err(other)?,
         };
 
-        let system = |id| tb::Account {
+        let system = |id, ledger| tb::Account {
             id,
-            ledger: LEDGER_SATS,
+            ledger,
             code: CODE_SYSTEM,
             ..Default::default()
         };
         ledger
-            .create_accounts(&[system(TREASURY_ID), system(REVENUE_ID)])
+            .create_accounts(&[
+                system(TREASURY_ID, LEDGER_SATS),
+                system(REVENUE_ID, LEDGER_SATS),
+                system(SUSPENSE_ID, LEDGER_SATS),
+                system(SOLD_ID, LEDGER_SATS),
+                system(BANK_ID, LEDGER_FIAT),
+                system(FX_FIAT_ID, LEDGER_FIAT),
+            ])
             .await?;
         Ok(ledger)
     }
@@ -77,6 +84,14 @@ fn is_closed(a: &tb::Account) -> bool {
     a.flags.0 & tb::AccountFlags::Closed.0 != 0
 }
 
+fn user_info(a: &tb::Account) -> UserInfo {
+    UserInfo {
+        pubkey: join_account(a.id, a.user_data_128),
+        balance: balance(a),
+        timestamp: a.timestamp,
+    }
+}
+
 fn file_info(a: &tb::Account) -> FileInfo {
     FileInfo {
         hash: join_account(a.id, a.user_data_128),
@@ -99,10 +114,7 @@ impl Ledger for TigerBeetleLedger {
             .lookup(id)
             .await?
             .filter(|a| a.code == CODE_USER && a.user_data_128 == account_rest(pubkey))
-            .map(|a| UserInfo {
-                pubkey: *pubkey,
-                balance: balance(&a),
-            }))
+            .map(|a| user_info(&a)))
     }
 
     async fn credit_user(&self, pubkey: &PubKeyBytes, amount: u64, payment_id: u128) -> Result<()> {
@@ -274,6 +286,9 @@ impl Ledger for TigerBeetleLedger {
                 flags: tb::TransferFlags::BalancingDebit,
                 ledger: LEDGER_SATS,
                 code: T_RENT,
+                // which provider this rent pays for, and for which day
+                user_data_32: file.user_data_32,
+                user_data_64: charge_id as u64,
                 ..Default::default()
             })
             .await?;
@@ -390,9 +405,218 @@ impl Ledger for TigerBeetleLedger {
             .map_err(other)?;
         Ok(accounts.iter().map(file_info).collect())
     }
+
+    async fn list_users(&self, since: u64, limit: usize) -> Result<Vec<UserInfo>> {
+        let accounts = self
+            .client
+            .query_accounts(tb::QueryFilter {
+                ledger: LEDGER_SATS,
+                code: CODE_USER,
+                timestamp_min: since,
+                limit: limit.min(8189) as u32,
+                ..Default::default()
+            })
+            .await
+            .map_err(other)?;
+        Ok(accounts.iter().map(user_info).collect())
+    }
+
+    async fn totals(&self) -> Result<Totals> {
+        let accounts = self
+            .accounts_by_id(&[TREASURY_ID, REVENUE_ID, SUSPENSE_ID, BANK_ID])
+            .await?;
+        let get = |id| accounts.get(&id).ok_or_else(|| other("system account missing"));
+        Ok(Totals {
+            received: sats(get(TREASURY_ID)?.debits_posted),
+            earned: sats(get(REVENUE_ID)?.credits_posted),
+            sold: sats(get(REVENUE_ID)?.debits_posted),
+            unclaimed: sats(get(SUSPENSE_ID)?.credits_posted),
+            fiat_in: sats(get(BANK_ID)?.credits_posted),
+            fiat_out: sats(get(BANK_ID)?.debits_posted),
+        })
+    }
+
+    async fn record_unclaimed(&self, amount: u64, id: u128) -> Result<()> {
+        if amount == 0 {
+            return Ok(());
+        }
+        let status = self
+            .transfer(tb::Transfer {
+                id: transfer_id(&[b"unclaimed", &id.to_be_bytes()]),
+                debit_account_id: TREASURY_ID,
+                credit_account_id: SUSPENSE_ID,
+                amount: amount as u128,
+                ledger: LEDGER_SATS,
+                code: T_UNCLAIMED,
+                ..Default::default()
+            })
+            .await?;
+        // if more money turned up after it was recorded the first time, it stays as it was
+        // and the audit sees the difference with the wallet
+        match status {
+            tb::CreateTransferStatus::Created => Ok(()),
+            s if is_exists(s) || exists_with_other_values(s) => Ok(()),
+            status => Err(other(format!("recording unclaimed: {status:?}"))),
+        }
+    }
+
+    async fn record_conversion(&self, reference: &str, sats_sold: u64, fiat_minor: u64) -> Result<bool> {
+        let reference_id = reference_id(reference);
+        let sats_id = transfer_id(&[b"convert", reference.as_bytes()]);
+        let fiat_id = transfer_id(&[b"convert-fiat", reference.as_bytes()]);
+
+        // a chain that is repeated fails as a whole (the transfer that exists counts as a
+        // failure for the chain), so look first
+        let before = self.client.lookup_transfers(&[sats_id, fiat_id]).await.map_err(other)?;
+        match before.as_slice() {
+            [] => {}
+            [a, b] => {
+                let same = |t: &tb::Transfer, amount: u64| t.amount == amount as u128;
+                let (s, f) = if a.id == sats_id { (a, b) } else { (b, a) };
+                return if same(s, sats_sold) && same(f, fiat_minor) {
+                    Ok(false)
+                } else {
+                    Err(LedgerError::ReferenceReused)
+                };
+            }
+            _ => return Err(other("half of a conversion exists")),
+        }
+
+        let transfers = [
+            tb::Transfer {
+                id: sats_id,
+                debit_account_id: REVENUE_ID,
+                credit_account_id: SOLD_ID,
+                amount: sats_sold as u128,
+                ledger: LEDGER_SATS,
+                code: T_CONVERT,
+                flags: tb::TransferFlags::Linked,
+                user_data_128: reference_id,
+                user_data_64: fiat_minor,
+                ..Default::default()
+            },
+            tb::Transfer {
+                id: fiat_id,
+                debit_account_id: FX_FIAT_ID,
+                credit_account_id: BANK_ID,
+                amount: fiat_minor as u128,
+                ledger: LEDGER_FIAT,
+                code: T_CONVERT,
+                user_data_128: reference_id,
+                user_data_64: sats_sold,
+                ..Default::default()
+            },
+        ];
+        let results = self.client.create_transfers(&transfers).await.map_err(other)?;
+        let statuses: Vec<_> = results.iter().map(|r| r.status).collect();
+        if statuses.iter().all(|s| *s == tb::CreateTransferStatus::Created) {
+            Ok(true)
+        } else {
+            Err(other(format!("recording conversion: {statuses:?}")))
+        }
+    }
+
+    async fn record_expense(&self, provider: u32, reference: &str, amount_minor: u64, date: u64) -> Result<bool> {
+        let account = expense_id(provider);
+        self.create_accounts(&[tb::Account {
+            id: account,
+            ledger: LEDGER_FIAT,
+            code: CODE_EXPENSE,
+            user_data_32: provider,
+            ..Default::default()
+        }])
+        .await?;
+
+        let status = self
+            .transfer(tb::Transfer {
+                id: transfer_id(&[b"expense", &provider.to_be_bytes(), reference.as_bytes()]),
+                debit_account_id: BANK_ID,
+                credit_account_id: account,
+                amount: amount_minor as u128,
+                ledger: LEDGER_FIAT,
+                code: T_EXPENSE,
+                user_data_128: reference_id(reference),
+                user_data_64: date,
+                user_data_32: provider,
+                ..Default::default()
+            })
+            .await?;
+        match status {
+            tb::CreateTransferStatus::Created => Ok(true),
+            s if is_exists(s) => Ok(false),
+            s if exists_with_other_values(s) => Err(LedgerError::ReferenceReused),
+            status => Err(other(format!("recording expense: {status:?}"))),
+        }
+    }
+
+    async fn expenses(&self, provider: u32) -> Result<Vec<Expense>> {
+        Ok(self
+            .account_transfers(expense_id(provider), T_EXPENSE)
+            .await?
+            .into_iter()
+            .map(|t| Expense {
+                provider,
+                amount_minor: sats(t.amount),
+                date: t.user_data_64,
+                timestamp: t.timestamp,
+                reference: t.user_data_128,
+            })
+            .collect())
+    }
+
+    async fn conversions(&self) -> Result<Vec<Conversion>> {
+        Ok(self
+            .account_transfers(SOLD_ID, T_CONVERT)
+            .await?
+            .into_iter()
+            .map(|t| Conversion {
+                sats: sats(t.amount),
+                fiat_minor: t.user_data_64,
+                timestamp: t.timestamp,
+                reference: t.user_data_128,
+            })
+            .collect())
+    }
+}
+
+/// the statuses of a transfer that was recorded before (with the same or other numbers)
+fn is_exists(status: tb::CreateTransferStatus) -> bool {
+    status == tb::CreateTransferStatus::Exists
+}
+
+fn exists_with_other_values(status: tb::CreateTransferStatus) -> bool {
+    format!("{status:?}").starts_with("ExistsWith")
 }
 
 impl TigerBeetleLedger {
+    async fn account_transfers(&self, account_id: u128, code: u16) -> Result<Vec<tb::Transfer>> {
+        const PAGE: u32 = 8189;
+        let mut out = vec![];
+        let mut after = 0;
+        loop {
+            let page = self
+                .client
+                .get_account_transfers(tb::AccountFilter {
+                    account_id,
+                    code,
+                    limit: PAGE,
+                    timestamp_min: after,
+                    flags: tb::AccountFilterFlags::Credits,
+                    ..Default::default()
+                })
+                .await
+                .map_err(other)?;
+            let Some(last) = page.last() else { break };
+            after = last.timestamp + 1;
+            let done = page.len() < PAGE as usize;
+            out.extend(page);
+            if done {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     async fn accounts_by_id(&self, ids: &[u128]) -> Result<std::collections::HashMap<u128, tb::Account>> {
         let mut out = std::collections::HashMap::new();
         for chunk in ids.chunks(8000) {

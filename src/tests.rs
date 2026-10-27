@@ -11,19 +11,43 @@ use ritualistic::blossom::{self, Verb};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-use crate::app::App;
+use crate::app::{App, parse_hash};
 use crate::config::*;
 use crate::ledger::MemoryLedger;
-use crate::payments::MockPayments;
+use crate::payments::{MockPayments, Payments};
 use crate::storage::{MemoryStorage, Providers};
 use crate::store::Store;
 
-const ADMIN: &str = "Bearer secret";
 
 struct Env {
     app: Arc<App>,
     router: Router,
     storage: Arc<MemoryStorage>,
+    payments: Arc<MockPayments>,
+}
+
+/// the hyperb identity of the operator in these tests
+fn operator_secret() -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&[7; 32])
+}
+
+fn operator_key() -> String {
+    lowercase_hex::encode(operator_secret().verifying_key().to_bytes())
+}
+
+fn provider(id: u32) -> ProviderConfig {
+    ProviderConfig {
+        id,
+        kind: ProviderKind::B2,
+        enabled: true,
+        weight: 1,
+        bucket: "b".into(),
+        region: String::new(),
+        endpoint: "http://localhost".into(),
+        access_key_id: String::new(),
+        secret_access_key: String::new(),
+        public_url: String::new(),
+    }
 }
 
 struct Reply {
@@ -37,25 +61,28 @@ fn env_with(restrictions: Restrictions) -> Env {
         listen: "127.0.0.1:0".into(),
         public_url: "https://cdn.test".into(),
         data_dir: String::new(),
-        admin_token: "secret".into(),
+        operators: vec![operator_key()],
+        fiat: Fiat::default(),
         restrictions,
         pricing: Pricing::default(),
         ledger: LedgerConfig::Memory,
         payments: PaymentsConfig::Mock,
-        providers: vec![],
+        providers: vec![provider(1)],
     };
     let storage = Arc::new(MemoryStorage::default());
+    let payments = Arc::new(MockPayments::default());
     let app = App::new(
         config,
         Arc::new(MemoryLedger::new()),
         Providers::from_parts(vec![(1, 1, storage.clone())]),
-        Arc::new(MockPayments::default()),
+        payments.clone(),
         Arc::new(Store::temporary().unwrap()),
     );
     Env {
         router: crate::http::router(app.clone()),
         app,
         storage,
+        payments,
     }
 }
 
@@ -105,8 +132,13 @@ impl Env {
             return r;
         }
         let id = r.body["id"].as_str().unwrap();
-        self.json("POST", &format!("/admin/orders/{id}/confirm"), &[("authorization", ADMIN.into())], json!({}))
-            .await
+        self.confirm(&id).await
+    }
+
+    /// the money for an order arrives
+    async fn confirm(&self, id: &str) -> Reply {
+        self.app.confirm_mock(id).await.unwrap();
+        self.call("GET", &format!("/api/orders/{id}"), &[], vec![]).await
     }
 
     async fn balance(&self, sk: &SecretKey) -> u64 {
@@ -140,8 +172,7 @@ impl Env {
             return r;
         }
         let id = r.body["id"].as_str().unwrap();
-        self.json("POST", &format!("/admin/orders/{id}/confirm"), &[("authorization", ADMIN.into())], json!({}))
-            .await
+        self.confirm(&id).await
     }
 }
 
@@ -180,9 +211,7 @@ async fn life_of_a_file() {
     assert!(!env.app.account(&alice.pubkey().0).await.unwrap().exists);
 
     // paid: the account appears with the money
-    let r = env
-        .json("POST", &format!("/admin/orders/{order_id}/confirm"), &[("authorization", ADMIN.into())], json!({}))
-        .await;
+    let r = env.confirm(&order_id).await;
     assert_eq!(r.body["status"], "paid");
     assert_eq!(env.balance(&alice).await, 1000);
     // looking at the order again doesn't credit again
@@ -302,12 +331,12 @@ async fn a_file_that_dies_with_a_payment_in_flight() {
         env.app.sweep(day).await.unwrap();
         day += 1;
     }
-    let r = env
-        .json("POST", &format!("/admin/orders/{id}/confirm"), &[("authorization", ADMIN.into())], json!({}))
-        .await;
+    let r = env.confirm(&id).await;
     assert_eq!(r.body["status"], "paid");
     assert_eq!(r.body["credits"][0]["result"], "gone");
     assert_eq!(env.file(&hash).await.body["balance_sats"], 0);
+    // the money did arrive, so it's in the books as unclaimed
+    assert_eq!(env.app.ledger.totals().await.unwrap().unclaimed, 50);
 }
 
 #[tokio::test]
@@ -403,20 +432,11 @@ async fn banning_an_uploader_removes_what_they_uploaded() {
     }
     let h = |d: &[u8]| blossom::sha256_hex(d);
 
-    // we can tell who uploaded, and nobody else can
-    let admin = [("authorization", ADMIN.to_string())];
-    let r = env.call("GET", &format!("/admin/files/{}", h(bad1)), &admin, vec![]).await;
-    assert_eq!(r.body["uploaders"], json!([evil.pubkey().to_hex()]));
-    let r = env.call("GET", &format!("/admin/files/{}", h(bad1)), &[("authorization", "Bearer nope".into())], vec![]).await;
-    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
-    let r = env.call("GET", &format!("/admin/files/{}", h(bad1)), &[], vec![]).await;
-    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+    // we can tell who uploaded
+    assert_eq!(env.app.uploaders(&parse_hash(&h(bad1)).unwrap()).await.unwrap(), vec![evil.pubkey().to_hex()]);
 
-    let r = env
-        .json("POST", "/admin/ban", &admin, json!({ "pubkey": evil.pubkey().to_hex(), "purge": true }))
-        .await;
-    assert_eq!(r.status, StatusCode::OK);
-    assert_eq!(r.body["purged"].as_array().unwrap().len(), 2);
+    let purged = env.app.ban_pubkey(&evil.pubkey().0, true).await.unwrap();
+    assert_eq!(purged.len(), 2);
 
     for d in [bad1, bad2] {
         env.app.served.clear();
@@ -430,9 +450,8 @@ async fn banning_an_uploader_removes_what_they_uploaded() {
     // the account is blocked
     assert_eq!(env.upload(&evil, b"more evil").await.status, StatusCode::FORBIDDEN);
     assert_eq!(env.fund(&evil, 1000).await.status, StatusCode::FORBIDDEN);
-    let r = env.call("GET", "/admin/bans", &admin, vec![]).await;
-    assert_eq!(r.body["pubkeys"], json!([evil.pubkey().to_hex()]));
-    assert_eq!(r.body["hashes"].as_array().unwrap().len(), 2);
+    assert_eq!(env.app.store.banned_pubkeys().unwrap(), vec![evil.pubkey().to_hex()]);
+    assert_eq!(env.app.store.banned_hashes().unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -491,4 +510,379 @@ async fn provider_choice_follows_weights() {
         assert_eq!(providers.pick(), Some(2));
     }
     assert_eq!(Providers::from_parts(vec![]).pick(), None);
+}
+
+#[tokio::test]
+async fn what_is_paid_and_not_used_goes_to_the_suspense_account() {
+    let env = env();
+    let alice = SecretKey::generate();
+    let r = env
+        .json(
+            "POST",
+            "/api/account/credit",
+            &[("authorization", blossom::create_auth_header(&alice, ACCOUNT, &[], None, "", 60))],
+            json!({ "amount_sats": 1000 }),
+        )
+        .await;
+    let id = r.body["id"].as_str().unwrap().to_string();
+    let order = env.app.store.order(&id).unwrap().unwrap();
+
+    // less than asked is not enough
+    env.payments.simulate(&order.payment, 999);
+    assert_eq!(env.call("GET", &format!("/api/orders/{id}"), &[], vec![]).await.body["status"], "pending");
+    assert!(!env.app.account(&alice.pubkey().0).await.unwrap().exists);
+
+    // and more than asked is credited as asked, with the rest kept apart
+    env.payments.simulate(&order.payment, 301);
+    let r = env.call("GET", &format!("/api/orders/{id}"), &[], vec![]).await;
+    assert_eq!((r.body["status"].as_str(), r.body["received_sats"].as_u64()), (Some("paid"), Some(1300)));
+    assert_eq!(env.balance(&alice).await, 1000);
+    let t = env.app.ledger.totals().await.unwrap();
+    assert_eq!((t.received, t.unclaimed), (1300, 300));
+}
+
+#[tokio::test]
+async fn the_audit_follows_the_money() {
+    let env = env();
+    let alice = SecretKey::generate();
+    env.fund(&alice, 1000).await;
+    env.upload(&alice, b"audit me").await;
+    let today = crate::app::now() / 86400;
+    env.app.sweep(today).await.unwrap();
+
+    let a = env.app.audit(30).await.unwrap();
+    assert_eq!(a.integrity.difference, 0);
+    assert_eq!((a.integrity.received, a.integrity.earned), (1000, 2));
+    assert_eq!(a.wallet.as_ref().unwrap().difference, 0);
+    assert_eq!(a.providers.len(), 1);
+    assert_eq!((a.providers[0].earned_sats, a.providers[0].paid_minor), (2, 0));
+    assert_eq!(a.obligations.open_files, 1);
+    assert_eq!(a.obligations.in_accounts, 1000 - 62);
+
+    // the operator takes the 2 sats out and sells them, but forgets to say so
+    *env.payments.spent.lock().unwrap() += 2;
+    let a = env.app.audit(30).await.unwrap();
+    assert_eq!(a.wallet.as_ref().unwrap().difference, -2);
+    assert!(a.warnings.iter().any(|w| w.level == crate::audit::Level::Failure && w.text.contains("2 sats less")));
+
+    // now they say so
+    assert!(env.app.record_conversion("trade-1", 2, 10, "market").await.unwrap());
+    assert!(!env.app.record_conversion("trade-1", 2, 10, "market").await.unwrap());
+    // the same reference with other numbers is a mistake, not a repeat
+    assert!(env.app.record_conversion("trade-1", 3, 10, "").await.is_err());
+    let a = env.app.audit(30).await.unwrap();
+    assert_eq!(a.wallet.as_ref().unwrap().difference, 0);
+    assert_eq!((a.position.sold_sats, a.position.unsold_sats), (2, 0));
+    assert_eq!(a.position.rate_source, Some("realized"));
+
+    // a bill
+    let date = today * 86400;
+    assert!(env.app.record_expense(1, "inv-1", 300, date, "storage").await.unwrap());
+    assert!(!env.app.record_expense(1, "inv-1", 300, date, "storage").await.unwrap());
+    assert!(env.app.record_expense(9, "inv-1", 300, date, "").await.is_err(), "no such provider");
+    assert!(env.app.record_expense(1, " ", 300, date, "").await.is_err(), "no reference");
+    assert!(env.app.record_expense(1, "inv-2", 0, date, "").await.is_err(), "nothing paid");
+    let a = env.app.audit(30).await.unwrap();
+    assert_eq!(a.providers[0].paid_minor, 300);
+    assert_eq!(a.position.fiat_on_hand_minor, 10 - 300);
+    // a bill from before the period isn't in it
+    env.app.record_expense(1, "inv-old", 999, (today - 200) * 86400, "").await.unwrap();
+    assert_eq!(env.app.audit(30).await.unwrap().providers[0].paid_minor, 300);
+    assert_eq!(env.app.audit(365).await.unwrap().providers[0].paid_minor, 1299);
+}
+
+// the operator interface
+
+fn hyperb_action(name: &str, signals: serde_json::Value, payload: Option<serde_json::Value>) -> String {
+    let mut a = json!({ "name": name, "signals": signals });
+    if let Some(p) = payload {
+        a["payload"] = p;
+    }
+    format!("action {a}\n")
+}
+
+async fn operator(env: &Env) -> crate::operator::OperatorSession {
+    let mut session = crate::operator::OperatorSession::new(env.app.clone());
+    let out = session.handle("hello {}\n").await;
+    assert!(out.contains("\"id\":\"audit_run\""), "{out}");
+    assert!(out.contains("Nothing entered yet."));
+    session
+}
+
+#[tokio::test]
+async fn the_operator_enters_the_books() {
+    let env = env();
+    let mut op = operator(&env).await;
+
+    let expense = |provider: &str, amount: &str, date: &str, reference: &str| {
+        hyperb_action(
+            "expense",
+            json!({ "expense": { "provider": provider, "amount": amount, "date": date, "reference": reference, "note": "march" } }),
+            None,
+        )
+    };
+
+    let out = op.handle(&expense("1", "12.34", "2026-03-01", "inv-9")).await;
+    assert!(out.contains("Recorded."), "{out}");
+    assert!(out.contains("2026-03-01 · 12.34 USD paid to 1 · b2 · inv-9 — march"), "{out}");
+    let e = env.app.ledger.expenses(1).await.unwrap();
+    assert_eq!((e[0].amount_minor, e[0].date), (1234, crate::operator::parse_date("2026-03-01").unwrap()));
+
+    assert!(op.handle(&expense("1", "12.34", "2026-03-01", "inv-9")).await.contains("recorded before"));
+    assert_eq!(env.app.ledger.expenses(1).await.unwrap().len(), 1);
+
+    // mistakes are explained and change nothing
+    assert!(op.handle(&expense("1", "abc", "2026-03-01", "x")).await.contains("The amount isn't a number."));
+    assert!(op.handle(&expense("1", "1", "2026-02-31", "x")).await.contains("The date should look like"));
+    assert!(op.handle(&expense("1", "1", "2026-03-01", "")).await.contains("a reference is needed"));
+    assert!(op.handle(&expense("7", "1", "2026-03-01", "x")).await.contains("there is no provider 7"));
+    assert_eq!(env.app.ledger.expenses(1).await.unwrap().len(), 1);
+
+    let out = op
+        .handle(&hyperb_action("sale", json!({ "sale": { "sats": "1,000", "fiat": "5.00", "reference": "t-1", "note": "" } }), None))
+        .await;
+    assert!(out.contains("Recorded."), "{out}");
+    assert!(out.contains("Sold 1,000 sats for 5.00 USD · t-1"), "{out}");
+    let c = env.app.ledger.conversions().await.unwrap();
+    assert_eq!((c[0].sats, c[0].fiat_minor), (1000, 500));
+
+    op.handle(&hyperb_action("set_rate", json!({ "rate": { "value": "60,000" } }), None)).await;
+    assert_eq!(env.app.store.rate().unwrap().unwrap().fiat_minor_per_btc, 6_000_000);
+
+    // $0.006 per GB per month is 0.6 cents
+    let out = op
+        .handle(&hyperb_action("set_prices", json!({ "prices": { "provider": "1", "storage": "0.006", "egress": "" } }), None))
+        .await;
+    assert!(out.contains("Saved."), "{out}");
+    let prices = env.app.store.prices(1).unwrap().unwrap();
+    assert!((prices.storage_per_gb_month_minor - 0.6).abs() < 1e-9);
+    assert_eq!(prices.egress_per_gb_minor, 0.0);
+    // and picking the provider again shows them
+    let out = op.handle(&hyperb_action("load_prices", json!({ "prices": { "provider": "1" } }), None)).await;
+    assert!(out.contains("\"storage\":\"0.006\""), "{out}");
+
+    // the audit uses it all
+    let out = op.handle(&hyperb_action("audit", json!({ "audit": { "days": "30" } }), None)).await;
+    assert!(out.contains("The ledger adds up"), "{out}");
+    assert!(out.contains("60,000.00 USD for 1 BTC (operator)"), "{out}");
+}
+
+#[tokio::test]
+async fn the_operator_moderates_and_runs_the_rent() {
+    let env = env();
+    let (evil, good) = (SecretKey::generate(), SecretKey::generate());
+    env.fund(&evil, 1000).await;
+    env.fund(&good, 1000).await;
+    env.upload(&evil, b"evil bytes").await;
+    env.upload(&good, b"good bytes").await;
+    let hash = blossom::sha256_hex(b"evil bytes");
+    let mut op = operator(&env).await;
+
+    // who did it
+    let out = op.handle(&hyperb_action("uploaders", json!({ "mod": { "hash": hash } }), None)).await;
+    assert!(out.contains(&format!("uploaded by {}", evil.pubkey().to_hex())), "{out}");
+    assert!(op.handle(&hyperb_action("uploaders", json!({ "mod": { "hash": "nope" } }), None)).await.contains("isn't a sha256"));
+    let out = op.handle(&hyperb_action("files_of", json!({ "mod": { "pubkey": evil.pubkey().to_hex() } }), None)).await;
+    assert!(out.contains("1 files by") && out.contains(&hash), "{out}");
+
+    // asking doesn't do anything yet
+    let ban = json!({ "mod": { "pubkey": evil.pubkey().to_hex(), "purge": true } });
+    let out = op.handle(&hyperb_action("ask_ban", ban, None)).await;
+    assert!(out.contains("\"open\":true") && out.contains("\"action\":\"ban_and_purge\""), "{out}");
+    assert!(!env.app.store.is_pubkey_banned(&evil.pubkey().to_hex()).unwrap());
+    assert_eq!(env.call("GET", &format!("/{hash}"), &[], vec![]).await.status, StatusCode::FOUND);
+
+    // saying yes does
+    let yes = json!({ "confirm": { "action": "ban_and_purge", "arg": evil.pubkey().to_hex() } });
+    let out = op.handle(&hyperb_action("confirmed", yes, None)).await;
+    assert!(out.contains("Banned, and 1 files removed."), "{out}");
+    assert!(out.contains(&format!("account {}", evil.pubkey().to_hex())), "the list of bans is updated");
+    env.app.served.clear();
+    assert_eq!(env.call("GET", &format!("/{hash}"), &[], vec![]).await.status, StatusCode::NOT_FOUND);
+    assert_eq!(env.upload(&evil, b"more").await.status, StatusCode::FORBIDDEN);
+
+    // one file
+    let hash = blossom::sha256_hex(b"good bytes");
+    let out = op.handle(&hyperb_action("ask_purge", json!({ "mod": { "hash": hash } }), None)).await;
+    assert!(out.contains("\"action\":\"purge\""));
+    let out = op
+        .handle(&hyperb_action("confirmed", json!({ "confirm": { "action": "purge", "arg": hash } }), None))
+        .await;
+    assert!(out.contains("Removed."), "{out}");
+    assert!(env.app.store.is_hash_banned(&hash).unwrap());
+
+    // nothing happens for an action nobody asked about
+    let out = op.handle(&hyperb_action("confirmed", json!({ "confirm": { "action": "", "arg": "" } }), None)).await;
+    assert!(!out.contains("Removed"));
+
+    // rent
+    env.upload(&good, b"rent payer").await;
+    let out = op.handle(&hyperb_action("sweep", json!({}), None)).await;
+    assert!(out.contains("1 files were charged 2 sats"), "{out}");
+
+    // orders waiting, and marking them as paid since payments are mock here
+    let hash = blossom::sha256_hex(b"rent payer");
+    let order = env.app.files_order([(hash.clone(), 77)].into()).await.unwrap();
+    let out = op.handle(&hyperb_action("orders", json!({}), None)).await;
+    assert!(out.contains("1 files") && out.contains("77 sats") && out.contains("Mark as paid"), "{out}");
+    let out = op.handle(&hyperb_action("mock_paid", json!({}), Some(json!(order.id)))).await;
+    assert!(out.contains("Marked as paid."), "{out}");
+    assert!(!out.contains("Mark as paid"), "it's not waiting any more");
+    assert_eq!(env.app.file_view(&parse_hash(&hash).unwrap()).await.unwrap().balance_sats, 62 - 2 + 77);
+}
+
+#[test]
+fn dates() {
+    use crate::operator::{format_date, parse_date};
+    assert_eq!(parse_date("1970-01-01"), None, "too old to be a bill");
+    assert_eq!(parse_date("2000-03-01"), Some(951_868_800));
+    assert_eq!(format_date(951_868_800), "2000-03-01");
+    assert_eq!(parse_date("2024-02-29").map(format_date).as_deref(), Some("2024-02-29"));
+    assert_eq!(parse_date("2025-02-29"), None);
+    assert_eq!(parse_date("2025-13-01"), None);
+    assert_eq!(parse_date("2025-1-1").map(format_date).as_deref(), Some("2025-01-01"));
+    assert_eq!(parse_date("tomorrow"), None);
+    assert_eq!(format_date(1_700_000_000), "2023-11-14");
+}
+
+// the hyperb session, authenticated by the key of the operator
+
+mod hyperb {
+    use super::*;
+    use ed25519_dalek::Signer;
+    use http_body_util::BodyExt;
+
+    async fn send(
+        env: &Env,
+        method: &str,
+        headers: &[(&str, String)],
+        body: &str,
+    ) -> axum::http::Response<Body> {
+        let mut req = Request::builder().method(method).uri("/operator");
+        for (k, v) in headers {
+            req = req.header(*k, v);
+        }
+        env.router.clone().oneshot(req.body(Body::from(body.to_string())).unwrap()).await.unwrap()
+    }
+
+    fn sign(key: &ed25519_dalek::SigningKey, session: &str) -> String {
+        lowercase_hex::encode(key.sign(session.as_bytes()).to_bytes())
+    }
+
+    async fn hello(env: &Env, key: &ed25519_dalek::SigningKey) -> axum::http::Response<Body> {
+        let k = lowercase_hex::encode(key.verifying_key().to_bytes());
+        send(env, "POST", &[("hyperb-key", k)], "hello {}\n").await
+    }
+
+    fn session_of(res: &axum::http::Response<Body>) -> String {
+        res.headers()["hyperb-session"].to_str().unwrap().to_string()
+    }
+
+    fn signed(key: &ed25519_dalek::SigningKey, session: &str) -> Vec<(&'static str, String)> {
+        vec![
+            ("hyperb-key", lowercase_hex::encode(key.verifying_key().to_bytes())),
+            ("hyperb-session", session.to_string()),
+            ("hyperb-signature", sign(key, session)),
+        ]
+    }
+
+    /// reads the stream until `needle` shows up
+    async fn read_until(body: &mut Body, needle: &str) -> String {
+        let mut seen = String::new();
+        loop {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(5), body.frame())
+                .await
+                .unwrap_or_else(|_| panic!("timed out waiting for {needle:?}, got {seen}"));
+            let frame = frame.unwrap_or_else(|| panic!("stream ended waiting for {needle:?}, got {seen}")).unwrap();
+            if let Some(data) = frame.data_ref() {
+                seen.push_str(&String::from_utf8_lossy(data));
+            }
+            if seen.contains(needle) {
+                return seen;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn only_the_operator_gets_in() {
+        let env = env();
+        let stranger = ed25519_dalek::SigningKey::from_bytes(&[8; 32]);
+        assert_eq!(hello(&env, &stranger).await.status(), StatusCode::FORBIDDEN);
+        assert_eq!(send(&env, "POST", &[], "hello {}\n").await.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(send(&env, "POST", &[("hyperb-key", "xyz".into())], "hello {}\n").await.status(), StatusCode::BAD_REQUEST);
+
+        let operator = operator_secret();
+        let res = hello(&env, &operator).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let session = session_of(&res);
+
+        let sse = |headers: Vec<(&'static str, String)>| {
+            let env = &env;
+            async move {
+                let mut h = headers;
+                h.push(("accept", "text/event-stream".into()));
+                send(env, "GET", &h, "").await.status()
+            }
+        };
+        // knowing the session id and the key is not enough
+        let wrong = signed(&stranger, &session);
+        assert_eq!(sse(vec![("hyperb-key", lowercase_hex::encode(operator_secret().verifying_key().to_bytes())), ("hyperb-session", session.clone()), ("hyperb-signature", wrong[2].1.clone())]).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(sse(wrong).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(sse(vec![("hyperb-session", session.clone())]).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(sse(signed(&operator, "unknown")).await, StatusCode::UNAUTHORIZED);
+
+        // lines can't be injected either
+        let mut forged = signed(&stranger, &session);
+        forged[0].1 = lowercase_hex::encode(operator.verifying_key().to_bytes());
+        assert_eq!(send(&env, "POST", &forged, "action {\"name\":\"sweep\"}\n").await.status(), StatusCode::UNAUTHORIZED);
+
+        // a page for people who wander in with a web browser
+        assert_eq!(send(&env, "GET", &[], "").await.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_whole_session() {
+        let env = env();
+        let operator = operator_secret();
+        let res = hello(&env, &operator).await;
+        let session = session_of(&res);
+
+        let mut h = signed(&operator, &session);
+        h.push(("accept", "text/event-stream".into()));
+        let res = send(&env, "GET", &h, "").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let mut stream = res.into_body();
+
+        // the interface arrives
+        let seen = read_until(&mut stream, "audit_run").await;
+        assert!(seen.contains("event: element") && seen.contains("event: signal"), "{seen}");
+        // a second stream for the same session is refused
+        assert_eq!(send(&env, "GET", &h, "").await.status(), StatusCode::CONFLICT);
+
+        // and answers to what the operator does
+        let action = hyperb_action("audit", json!({ "audit": { "days": "7" } }), None);
+        assert_eq!(send(&env, "POST", &signed(&operator, &session), &action).await.status(), StatusCode::NO_CONTENT);
+        read_until(&mut stream, "The ledger adds up").await;
+
+        drop(stream);
+    }
+
+    #[tokio::test]
+    async fn without_operators_the_interface_does_not_exist() {
+        let mut env = env();
+        let mut config = env.app.config.clone();
+        config.operators.clear();
+        env.app = App::new(
+            config,
+            Arc::new(MemoryLedger::new()),
+            Providers::from_parts(vec![]),
+            Arc::new(MockPayments::default()),
+            Arc::new(Store::temporary().unwrap()),
+        );
+        env.router = crate::http::router(env.app.clone());
+        assert_eq!(hello(&env, &operator_secret()).await.status(), StatusCode::NOT_FOUND);
+        let mut h = signed(&operator_secret(), "x");
+        h.push(("accept", "text/event-stream".into()));
+        assert_eq!(send(&env, "GET", &h, "").await.status(), StatusCode::NOT_FOUND);
+    }
 }
