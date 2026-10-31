@@ -14,7 +14,7 @@ pub struct Config {
     /// public base url of this server, used to build blob urls, e.g. https://cdn.example.com
     pub public_url: String,
 
-    /// where the local state (pending orders, bans) is kept
+    /// where the local state (pending orders, bans) and the ledger are kept
     #[serde(default = "default_data_dir")]
     pub data_dir: String,
 
@@ -34,6 +34,7 @@ pub struct Config {
     #[serde(default)]
     pub pricing: Pricing,
 
+    #[serde(default)]
     pub ledger: LedgerConfig,
 
     pub payments: PaymentsConfig,
@@ -255,15 +256,20 @@ impl Pricing {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
 pub enum LedgerConfig {
-    /// a tigerbeetle cluster
-    Tigerbeetle {
+    /// our own books, in an orangedb database file
+    Orangedb {
+        /// `ledger.redb` in the data dir by default
         #[serde(default)]
-        cluster_id: u64,
-        /// comma separated replica addresses
-        addresses: String,
+        path: Option<String>,
     },
     /// volatile, for development only
     Memory,
+}
+
+impl Default for LedgerConfig {
+    fn default() -> Self {
+        LedgerConfig::Orangedb { path: None }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

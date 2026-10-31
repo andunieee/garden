@@ -32,10 +32,8 @@ sats_per_mib_per_day = 0.1
 min_days = 30
 
 [ledger]
-kind = "tigerbeetle"
-# 0 is reserved for testing; the VPS installer generates a random nonzero id
-cluster_id = 0
-addresses = "127.0.0.1:3001"
+kind = "orangedb"
+# path = "./data/ledger.redb"   # the default is ledger.redb in data_dir
 # kind = "memory"   # development only, forgets everything on restart
 
 [payments]

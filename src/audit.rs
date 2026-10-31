@@ -9,7 +9,7 @@ use serde::Serialize;
 
 use crate::app::{App, Result, now};
 use crate::config::{Fiat, Pricing};
-use crate::ledger::{self, Expense, FileInfo, Totals};
+use crate::ledger::{Expense, FileInfo, Totals};
 use crate::store::{DayStats, ProviderPrices, Rate};
 
 const SATS_PER_BTC: i128 = 100_000_000;
@@ -398,10 +398,8 @@ impl App {
         let to_day = now() / 86400;
         let from_day = to_day.saturating_sub(days.max(1) - 1);
 
-        let mut in_accounts = 0;
-        ledger::all_users(&*self.ledger, |u| in_accounts += u.balance).await?;
-        let mut files = vec![];
-        ledger::all_files(&*self.ledger, |f| files.push(f)).await?;
+        let in_accounts = self.ledger.users().await?.iter().map(|u| u.balance).sum();
+        let files = self.ledger.files().await?;
 
         let wallet = match self.payments.wallet_balance().await {
             Ok(w) => w,

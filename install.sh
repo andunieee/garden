@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install garden and its TigerBeetle ledger on a Linux VPS.
+# Install garden on a Linux VPS.
 #
 # Run from an unpacked release:
 #   sudo ./install.sh --domain cdn.example.com
@@ -11,8 +11,6 @@ set -euo pipefail
 
 REPO="${GARDEN_REPO:-andunieee/garden}"
 VERSION="${GARDEN_VERSION:-latest}"
-# keep in sync with the tigerbeetle client version in Cargo.toml
-TB_VERSION="0.17.9"
 SERVICE_USER="garden"
 PREFIX="/opt/garden"
 CONFIG_DIR="/etc/garden"
@@ -103,27 +101,23 @@ fi
 case "$(uname -m)" in
     x86_64|amd64)
         TARGET="x86_64-unknown-linux-gnu"
-        TB_ARCH="x86_64-linux"
-        TB_SHA256="af71f2c0057e3b409bf79940fa94894b738187b0d4f1e711097bca15df5d8cd4"
         ;;
     aarch64|arm64)
         TARGET="aarch64-unknown-linux-gnu"
-        TB_ARCH="aarch64-linux"
-        TB_SHA256="413994920fe48b04f5aa86895b7a1d9d98d14803b29d4e91d2a6d0098fff4ef2"
         ;;
     *)
         die "unsupported architecture: $(uname -m) (x86_64 and aarch64 are supported)"
         ;;
 esac
 
-if ! command -v curl >/dev/null 2>&1 || ! command -v unzip >/dev/null 2>&1; then
-    command -v apt-get >/dev/null 2>&1 || die "curl and unzip are required; install them first"
-    log "installing curl, unzip, and CA certificates"
+if ! command -v curl >/dev/null 2>&1; then
+    command -v apt-get >/dev/null 2>&1 || die "curl is required; install it first"
+    log "installing curl and CA certificates"
     apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ca-certificates curl unzip
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ca-certificates curl
 fi
 
-for cmd in curl tar sha256sum unzip; do
+for cmd in curl tar sha256sum; do
     command -v "$cmd" >/dev/null 2>&1 || die "$cmd is required"
 done
 
@@ -141,11 +135,6 @@ fi
 install -d -m 0755 "$PREFIX" "$PREFIX/bin"
 install -d -m 0750 -o root -g "$SERVICE_USER" "$CONFIG_DIR"
 install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_USER" "$STATE_DIR" "$STATE_DIR/data"
-
-avail_kb="$(df -Pk "$STATE_DIR" | awk 'NR == 2 { print $4 }')"
-if [[ -n "$avail_kb" ]] && (( avail_kb < 2097152 )); then
-    warn "less than 2 GiB free in $STATE_DIR; TigerBeetle preallocates about 1.1 GiB"
-fi
 
 work="$(mktemp -d "${TMPDIR:-/tmp}/garden-install.XXXXXX")"
 cleanup() {
@@ -184,24 +173,9 @@ fi
 [[ -x "$src/garden" ]] || die "the release does not contain the garden binary"
 [[ -f "$src/garden.example.toml" ]] || die "the release does not contain garden.example.toml"
 [[ -f "$src/systemd/garden.service" ]] || die "the release does not contain systemd/garden.service"
-[[ -f "$src/systemd/tigerbeetle.service" ]] || die "the release does not contain systemd/tigerbeetle.service"
 
 log "installing garden"
 install -m 0755 "$src/garden" "$PREFIX/bin/garden"
-
-log "downloading TigerBeetle ${TB_VERSION}"
-tb_zip="$work/tigerbeetle.zip"
-curl -fL --retry 3 --retry-delay 2 --proto '=https' --tlsv1.2 \
-    -o "$tb_zip" \
-    "https://github.com/tigerbeetle/tigerbeetle/releases/download/${TB_VERSION}/tigerbeetle-${TB_ARCH}.zip"
-printf '%s  %s\n' "$TB_SHA256" "$tb_zip" | sha256sum -c -
-unzip -p "$tb_zip" tigerbeetle > "$work/tigerbeetle"
-install -m 0755 "$work/tigerbeetle" "$PREFIX/bin/tigerbeetle"
-
-tb_version="$("$PREFIX/bin/tigerbeetle" version)"
-if [[ "$tb_version" != *"$TB_VERSION"* ]]; then
-    die "expected TigerBeetle ${TB_VERSION}, got: ${tb_version}"
-fi
 
 config="$CONFIG_DIR/garden.toml"
 created_config=0
@@ -220,11 +194,6 @@ elif [[ ! -e "$config" ]]; then
 
     sed -i 's|^listen = .*|listen = "127.0.0.1:3000"|' "$config"
     sed -i 's|^data_dir = .*|data_dir = "/var/lib/garden/data"|' "$config"
-
-    # 0 is reserved by TigerBeetle for testing; give production its own id.
-    cluster_id="$(od -An -N8 -tu8 /dev/urandom | tr -d ' \n')"
-    [[ "$cluster_id" == "0" ]] && cluster_id=1
-    sed -i "s|^cluster_id = .*|cluster_id = ${cluster_id}|" "$config"
 
     if [[ -n "$DOMAIN" ]]; then
         public_url="$DOMAIN"
@@ -259,6 +228,16 @@ if grep -q '^listen = "0.0.0.0' "$config" || grep -q '^listen = "\[::\]' "$confi
     warn "garden listens on all interfaces; use 127.0.0.1 behind a TLS reverse proxy"
 fi
 
+if grep -q '^kind = "tigerbeetle"' "$config"; then
+    warn "$config still uses the TigerBeetle ledger, which garden no longer supports."
+    warn "the ledger is now kept in data_dir/ledger.redb; replace the [ledger] section with"
+    warn '  kind = "orangedb". the accounts in the old TigerBeetle file are not migrated.'
+fi
+if [[ -f /etc/systemd/system/tigerbeetle.service ]]; then
+    warn "a tigerbeetle.service from an older release is still installed; garden doesn't use"
+    warn "it anymore. stop it when you no longer need its data: systemctl disable --now tigerbeetle"
+fi
+
 if (( ${#OPERATORS[@]} > 0 )) && ! grep -Fq "${OPERATORS[0]}" "$config"; then
     warn "the existing config was kept; add the operator key(s) to operators in $config"
 fi
@@ -282,30 +261,11 @@ if [[ "$ldd_out" == *"not found"* ]]; then
 fi
 
 log "installing systemd units"
-install -m 0644 "$src/systemd/tigerbeetle.service" /etc/systemd/system/tigerbeetle.service
 install -m 0644 "$src/systemd/garden.service" /etc/systemd/system/garden.service
 if [[ -f "$src/Caddyfile.example" ]]; then
     install -m 0644 "$src/Caddyfile.example" "$CONFIG_DIR/Caddyfile.example"
 fi
 systemctl daemon-reload
-
-cluster_id="$(sed -n 's/^[[:space:]]*cluster_id[[:space:]]*=[[:space:]]*\([0-9][0-9_]*\).*/\1/p' "$config" | head -n 1)"
-cluster_id="${cluster_id//_/}"
-[[ -n "$cluster_id" ]] || cluster_id=0
-
-if [[ ! -f "$STATE_DIR/0_0.tigerbeetle" ]]; then
-    log "formatting the TigerBeetle data file (one time)"
-    if command -v runuser >/dev/null 2>&1; then
-        runuser -u "$SERVICE_USER" -- "$PREFIX/bin/tigerbeetle" format \
-            --cluster="$cluster_id" --replica=0 --replica-count=1 "$STATE_DIR/0_0.tigerbeetle"
-    else
-        "$PREFIX/bin/tigerbeetle" format \
-            --cluster="$cluster_id" --replica=0 --replica-count=1 "$STATE_DIR/0_0.tigerbeetle"
-        chown "$SERVICE_USER:$SERVICE_USER" "$STATE_DIR/0_0.tigerbeetle"
-    fi
-else
-    log "keeping the existing TigerBeetle data file"
-fi
 
 if grep -q '^public_url = "https://cdn.example.com"' "$config"; then
     warn "public_url is still the example; set it to the real public URL"
@@ -324,10 +284,9 @@ elif grep -q '^public_url = "https://cdn.example.com"' "$config"; then
 fi
 
 if [[ "$config_ready" -eq 1 ]]; then
-    systemctl enable tigerbeetle.service garden.service >/dev/null
+    systemctl enable garden.service >/dev/null
     if [[ "$START" -eq 1 ]]; then
         log "starting the services"
-        systemctl start tigerbeetle.service
         systemctl restart garden.service
         log "garden should now be running"
     else
@@ -357,7 +316,7 @@ Finish the configuration first:
      - add your hyperb operator key to operators (optional)
   2. enable and start:
 
-     systemctl enable --now tigerbeetle.service garden.service
+     systemctl enable --now garden.service
 
 EOF
 fi
@@ -365,5 +324,5 @@ fi
 cat <<EOF
 Back up $config (it holds the Arkade seed and provider keys) and $STATE_DIR.
 Put a TLS reverse proxy in front of the server; an example is at
-$CONFIG_DIR/Caddyfile.example. Do not expose ports 3000 or 3001.
+$CONFIG_DIR/Caddyfile.example. Do not expose port 3000.
 EOF

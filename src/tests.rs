@@ -13,7 +13,7 @@ use tower::ServiceExt;
 
 use crate::app::{App, parse_hash};
 use crate::config::*;
-use crate::ledger::MemoryLedger;
+use crate::ledger::OrangeLedger;
 use crate::payments::{MockPayments, Payments};
 use crate::storage::{MemoryStorage, Providers};
 use crate::store::Store;
@@ -73,7 +73,7 @@ fn env_with(restrictions: Restrictions) -> Env {
     let payments = Arc::new(MockPayments::default());
     let app = App::new(
         config,
-        Arc::new(MemoryLedger::new()),
+        Arc::new(OrangeLedger::in_memory().unwrap()),
         Providers::from_parts(vec![(1, 1, storage.clone())]),
         payments.clone(),
         Arc::new(Store::temporary().unwrap()),
@@ -874,7 +874,7 @@ mod hyperb {
         config.operators.clear();
         env.app = App::new(
             config,
-            Arc::new(MemoryLedger::new()),
+            Arc::new(OrangeLedger::in_memory().unwrap()),
             Providers::from_parts(vec![]),
             Arc::new(MockPayments::default()),
             Arc::new(Store::temporary().unwrap()),

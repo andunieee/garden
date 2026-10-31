@@ -1,9 +1,8 @@
 [Unit]
 Description=garden blossom server
 Documentation=https://github.com/andunieee/garden
-After=network-online.target tigerbeetle.service
+After=network-online.target
 Wants=network-online.target
-Requires=tigerbeetle.service
 
 [Service]
 Type=simple

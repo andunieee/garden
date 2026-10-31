@@ -56,8 +56,7 @@ jobs:
           install -m 0755 "target/$TARGET/release/garden" "$stage/garden"
           install -m 0644 garden.example.toml README.md "$stage/"
           install -m 0755 install.sh "$stage/install.sh"
-          install -m 0644 packaging/systemd/garden.service \
-            packaging/systemd/tigerbeetle.service "$stage/systemd/"
+          install -m 0644 packaging/systemd/garden.service "$stage/systemd/"
           install -m 0644 packaging/Caddyfile.example "$stage/Caddyfile.example"
 
           strip "$stage/garden" || true

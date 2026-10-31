@@ -7,7 +7,7 @@ description = "a blossom server where files are kept alive by sats"
 
 [dependencies]
 ritualistic = { version = "0.2.4", default-features = false }
-tigerbeetle = "=0.17.9"
+orangedb = "0.1"
 ark-client = "0.12"
 ark-core = "0.12"
 bitcoin = "0.32"

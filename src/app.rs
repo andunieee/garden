@@ -475,13 +475,8 @@ impl App {
 
     /// take one day of rent from every file and get rid of those that ran out of sats
     pub async fn sweep(&self, day: u64) -> Result<SweepReport> {
-        let mut files = vec![];
-        ledger::all_files(&*self.ledger, |f| {
-            if !f.closed {
-                files.push(f)
-            }
-        })
-        .await?;
+        let mut files = self.ledger.files().await?;
+        files.retain(|f| !f.closed);
 
         let mut report = SweepReport {
             files: files.len(),
@@ -489,22 +484,34 @@ impl App {
         };
         // provider -> (files, bytes, sats of rent)
         let mut by_provider: std::collections::BTreeMap<u32, (u64, u64, u64)> = Default::default();
-        for f in files {
-            let lock = self.lock(&f.hash);
-            let _guard = lock.lock().await;
+        let charges: Vec<_> = files
+            .iter()
+            .map(|f| (f.hash, self.config.pricing.rent_per_day(f.size)))
+            .collect();
+        let charged = self.ledger.charge_files(&charges, day as u128).await?;
 
-            let rent = self.config.pricing.rent_per_day(f.size);
-            let taken = match self.ledger.charge_file(&f.hash, rent, day as u128).await {
-                Ok(t) => t,
+        let mut empty = vec![];
+        for (f, result) in files.into_iter().zip(charged) {
+            let charged = match result {
+                Ok(c) => c,
                 Err(e) => {
                     log::error!("charging {}: {e}", hex(&f.hash));
                     continue;
                 }
             };
-            report.charged_sats += taken;
+            report.charged_sats += charged.taken;
             let p = by_provider.entry(f.provider).or_default();
-            *p = (p.0 + 1, p.1 + f.size, p.2 + taken);
+            *p = (p.0 + 1, p.1 + f.size, p.2 + charged.taken);
+            if charged.left == 0 {
+                empty.push(f);
+            }
+        }
 
+        for f in empty {
+            let lock = self.lock(&f.hash);
+            let _guard = lock.lock().await;
+
+            // it may have been paid for since it was charged
             match self.ledger.file(&f.hash).await {
                 Ok(Some(after)) if !after.closed && after.balance == 0 => {
                     log::info!("{} ran out of sats", hex(&f.hash));

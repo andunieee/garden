@@ -20,14 +20,16 @@ async fn build(config: Config) -> Result<Arc<App>, String> {
     let store = Arc::new(store::Store::open(&config.data_dir).map_err(|e| e.to_string())?);
 
     let ledger: ledger::SharedLedger = match &config.ledger {
-        LedgerConfig::Tigerbeetle { cluster_id, addresses } => Arc::new(
-            ledger::TigerBeetleLedger::connect(*cluster_id, addresses)
-                .await
-                .map_err(|e| e.to_string())?,
-        ),
+        LedgerConfig::Orangedb { path } => {
+            let path = match path {
+                Some(p) => std::path::PathBuf::from(p),
+                None => std::path::Path::new(&config.data_dir).join("ledger.redb"),
+            };
+            Arc::new(ledger::OrangeLedger::open(&path).map_err(|e| format!("{}: {e}", path.display()))?)
+        }
         LedgerConfig::Memory => {
             log::warn!("the ledger is in memory, everything will be forgotten when we stop");
-            Arc::new(ledger::MemoryLedger::new())
+            Arc::new(ledger::OrangeLedger::in_memory().map_err(|e| e.to_string())?)
         }
     };
 

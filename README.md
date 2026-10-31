@@ -14,7 +14,7 @@ cargo run --release -- garden.toml
 - **Rent**: once a day every file pays `base_sats_per_day + ceil(MiB * sats_per_mib_per_day)`. When a file's balance hits zero its account is closed and the blob is deleted (deletions that fail are retried).
 - **Serving**: `GET /<sha256>[.ext]` redirects (302) to the provider that holds the file, or 404 if it isn't alive.
 - **Anyone can pay for any file**: `POST /api/topup {"files": {"<sha256>": sats, ...}}` needs no account or authorization. One order can pay for many files and the sats go straight to the file accounts when it is paid.
-- **No owners.** Files have no owner and can't be deleted by users. [TigerBeetle](https://tigerbeetle.com) is the only record of accounts and files. How it is laid out is documented at the top of `src/ledger/mod.rs`; the short version is that ids are the first half of the pubkey/hash and `user_data_128` holds the second half, so everything is recoverable from the ledger, and an upload is a transfer `user -> file`, which is how the operator interface finds the uploader of a file (and the files of an uploader).
+- **No owners.** Files have no owner and can't be deleted by users. The ledger is the only record of accounts and files. It is double-entry bookkeeping of our own, kept with [orangedb](https://github.com/andunieee/orangedb) in `ledger.redb`; the tables are in `src/ledger/schema.rs`. An upload is a transfer `user -> file`, which is how the operator interface finds the uploader of a file (and the files of an uploader).
 - **Moderation** is done in the operator interface (below): find who uploaded a file, ban an account and optionally remove everything it uploaded, remove and block one file.
 
 ## The operator interface
@@ -32,7 +32,7 @@ It has four tabs:
 
 ## The books and the audit
 
-The ledger has two currencies in TigerBeetle: sats, and a fiat ledger (`[fiat]` in the settings) for the money you pay the providers with. Every sat that arrives is somewhere: in a user, in a file, earned as rent, sold, or *unclaimed* (paid and not used, such as an overpayment or a payment for a file that had already expired).
+The ledger has two currencies: sats, and a fiat ledger (`[fiat]` in the settings) for the money you pay the providers with. Every sat that arrives is somewhere: in a user, in a file, earned as rent, sold, or *unclaimed* (paid and not used, such as an overpayment or a payment for a file that had already expired).
 
 What you enter is optional. The audit uses what it has:
 
@@ -54,8 +54,7 @@ See `garden.example.toml`. `[restrictions]` is where account/upload rules go (`R
 
 ## Running the pieces
 
-- TigerBeetle: `tigerbeetle format --cluster=0 --replica=0 --replica-count=1 0_0.tigerbeetle && tigerbeetle start --addresses=127.0.0.1:3001 0_0.tigerbeetle`. The client is pinned to `0.17.9`, run the same server version.
-- The test for the TigerBeetle ledger needs a running server: see `src/ledger/tigerbeetle.rs`.
+- The ledger needs nothing running: it is a file, `ledger.redb` in `data_dir` (or `path` in `[ledger]`).
 - For development use `kind = "memory"` for the ledger and `kind = "mock"` for payments; orders are then marked as paid in the operator interface.
 
 ## Deploying on a VPS
@@ -85,12 +84,10 @@ sudo bash install.sh --domain cdn.example.com --operator YOUR_HYPERB_PUBKEY_HEX
 The installer:
 
 - installs `garden` in `/opt/garden/bin`;
-- downloads TigerBeetle `0.17.9`, verifies its checksum, and installs it next to garden;
-- creates `/etc/garden/garden.toml` with a generated Arkade seed and a random
-  nonzero TigerBeetle cluster id, `listen = "127.0.0.1:3000"`, and
-  `data_dir = "/var/lib/garden/data"`;
-- creates `/var/lib/garden` and formats `0_0.tigerbeetle` once, only if it is absent;
-- installs the `garden` and `tigerbeetle` systemd units.
+- creates `/etc/garden/garden.toml` with a generated Arkade seed,
+  `listen = "127.0.0.1:3000"`, and `data_dir = "/var/lib/garden/data"`;
+- creates `/var/lib/garden`;
+- installs the `garden` systemd unit.
 
 It will not enable or start the services while `public_url` is still
 `https://cdn.example.com` or the example provider credentials are still in the
@@ -98,7 +95,7 @@ config. Finish the config first:
 
 ```bash
 sudoedit /etc/garden/garden.toml   # set public_url and the provider credentials
-sudo systemctl enable --now tigerbeetle.service garden.service
+sudo systemctl enable --now garden.service
 ```
 
 To deploy a config you already prepared, pass it in; the installer keeps a
@@ -134,18 +131,18 @@ The body limit must be at least `restrictions.max_file_size`. With nginx, also
 set `proxy_request_buffering off` and a long `proxy_read_timeout`, and raise
 `client_max_body_size`; otherwise large uploads fail before they reach garden.
 
-Open only ports 80 and 443. Do not expose 3000 or 3001.
+Open only ports 80 and 443. Do not expose 3000.
 
 ### What the VPS needs
 
 - Outbound HTTPS to `arkade.computer` and to the S3/B2/R2 endpoints.
 - A working clock (NTP); rent is charged per Unix day.
-- At least 2 GB free disk. TigerBeetle preallocates a ~1.1 GiB data file,
-  before `garden.redb` and the rest of the system. Keep `/var/lib/garden` on a
-  local filesystem that supports io_uring and `O_DIRECT`, not on NFS.
+- A little disk for `garden.redb` and `ledger.redb`, which grow with the number
+  of accounts, files and transfers. Keep `/var/lib/garden` on a local
+  filesystem, not on NFS.
 - Enough RAM for in-flight uploads: each upload is buffered up to
   `restrictions.max_file_size` while it is hashed, so 100 MiB uploads need
-  headroom beyond the base process and TigerBeetle cache.
+  headroom beyond the base process.
 - Provider buckets whose `public_url` is publicly readable, because serving a
   blob is a redirect to the provider.
 
@@ -155,12 +152,11 @@ Back up these together:
 
 - `/etc/garden/garden.toml` (Arkade seed and provider keys)
 - `/var/lib/garden/data/garden.redb` (orders, bans, pending deletions)
-- `/var/lib/garden/0_0.tigerbeetle` (accounts and files)
+- `/var/lib/garden/data/ledger.redb` (accounts, files and every transfer)
 
 To upgrade, run the installer again from the new release. It keeps the config
-and data, replaces the garden binary, and restarts garden. It does not restart a
-running TigerBeetle. Never delete `0_0.tigerbeetle`, and never run
-`tigerbeetle format` on an existing ledger file.
+and data, replaces the garden binary, and restarts garden. Never delete
+`ledger.redb`: it is the only record of who has paid for what.
 
 ## Things to know
 
