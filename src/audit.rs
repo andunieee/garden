@@ -10,6 +10,7 @@ use serde::Serialize;
 use crate::app::{App, Result, now};
 use crate::config::{Fiat, Pricing};
 use crate::ledger::{Expense, FileInfo, Totals};
+use crate::payments::Payments;
 use crate::store::{DayStats, ProviderPrices, Rate};
 
 const SATS_PER_BTC: i128 = 100_000_000;

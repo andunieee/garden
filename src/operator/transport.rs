@@ -9,6 +9,11 @@
 //!
 //! only the keys listed in the `operators` setting get a session, and each request has to be
 //! signed by the key that opened it.
+//!
+//! while there is no operator, the server logs a setup link with a secret in its fragment,
+//! which hyperb sends in the `hello` (`{"params":{"setup":"..."}}`). the key that brings it
+//! first becomes the operator and is added to the config file. this is how a headless server
+//! is taken over the first time.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -76,12 +81,16 @@ pub fn verify(key: &str, message: &[u8], signature: &str) -> bool {
     key.verify(message, &Signature::from_bytes(&sig)).is_ok()
 }
 
+/// the secret of the setup link, if the hello brings one
+fn setup_param(hello: &str) -> Option<String> {
+    match hypereffect::RendererMessage::parse(hello.lines().next()?) {
+        Ok(hypereffect::RendererMessage::Hello { mut params }) => params.remove("setup"),
+        _ => None,
+    }
+}
+
 /// a hello, or a line for a session
 async fn post(State(app): State<Arc<App>>, headers: HeaderMap, body: String) -> Response {
-    if app.config.operators.is_empty() {
-        return (StatusCode::NOT_FOUND, "the operator interface is disabled").into_response();
-    }
-
     if headers.contains_key(SESSION) {
         let map = app.sessions.0.lock().unwrap();
         return match authorize(&map, &headers) {
@@ -94,9 +103,31 @@ async fn post(State(app): State<Arc<App>>, headers: HeaderMap, body: String) -> 
     let Some(key) = header_str(&headers, KEY).map(str::to_lowercase).filter(|k| key_bytes(k).is_some()) else {
         return (StatusCode::BAD_REQUEST, format!("missing or invalid {KEY}")).into_response();
     };
-    if !app.config.operators.iter().any(|k| k.to_lowercase() == key) {
-        log::warn!("the key {key} tried to open the operator interface, add it to `operators` if it's yours");
-        return (StatusCode::FORBIDDEN, "this key is not an operator").into_response();
+    let mut welcome = None;
+    if !app.is_operator(&key) {
+        match setup_param(&body) {
+            Some(token) if !app.has_operators() => match app.claim_operator(&key, &token) {
+                Ok(true) => welcome = Some(("success", "You are the operator of this server now.".to_string())),
+                Ok(false) => {
+                    return (StatusCode::FORBIDDEN, "this setup link is not valid: it changes every time the server starts")
+                        .into_response();
+                }
+                Err(e) => {
+                    log::error!("{e}");
+                    welcome = Some((
+                        "warning",
+                        format!("You are the operator until the server restarts, but {e}. Add your key to `operators` by hand."),
+                    ));
+                }
+            },
+            _ if !app.has_operators() => {
+                return (StatusCode::NOT_FOUND, "this server has no operator yet: open the setup link from its log").into_response();
+            }
+            _ => {
+                log::warn!("the key {key} tried to open the operator interface, add it to `operators` if it's yours");
+                return (StatusCode::FORBIDDEN, "this key is not an operator").into_response();
+            }
+        }
     }
 
     let id = lowercase_hex::encode(rand::random::<[u8; 32]>());
@@ -119,7 +150,7 @@ async fn post(State(app): State<Arc<App>>, headers: HeaderMap, body: String) -> 
 
     let (task_app, sid) = (app.clone(), id.clone());
     tokio::spawn(async move {
-        run(task_app.clone(), body, rx).await;
+        run(task_app.clone(), body, rx, welcome).await;
         task_app.sessions.0.lock().unwrap().remove(&sid);
     });
     ([(SESSION, id)], StatusCode::OK).into_response()
@@ -135,10 +166,6 @@ async fn stream(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
         )
             .into_response();
     }
-    if app.config.operators.is_empty() {
-        return (StatusCode::NOT_FOUND, "the operator interface is disabled").into_response();
-    }
-
     let mut map = app.sessions.0.lock().unwrap();
     let id = header_str(&headers, SESSION).unwrap_or_default().to_string();
     let session = match authorize(&map, &headers) {
@@ -186,10 +213,13 @@ fn authorize<'a>(map: &'a HashMap<String, Session>, headers: &HeaderMap) -> Resu
 }
 
 /// runs the interface of a session until its stream closes
-async fn run(app: Arc<App>, hello: String, mut cmds: mpsc::UnboundedReceiver<Cmd>) {
+async fn run(app: Arc<App>, hello: String, mut cmds: mpsc::UnboundedReceiver<Cmd>, welcome: Option<(&str, String)>) {
     let mut session = OperatorSession::new(app);
     // what was said before the stream opened
     let mut backlog = session.handle(&hello).await;
+    if let Some((kind, text)) = welcome {
+        backlog.push_str(&OperatorSession::notice(kind, &text));
+    }
     let mut out: Option<mpsc::UnboundedSender<String>> = None;
     let deadline = tokio::time::sleep(STREAM_TIMEOUT);
     tokio::pin!(deadline);

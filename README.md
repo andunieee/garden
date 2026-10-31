@@ -21,14 +21,17 @@ cargo run --release -- garden.toml
 
 Everything the operator does against the server happens in a [hyperb](https://github.com/andunieee/hyperb) app, at `hyperb://<your server>/operator`. There is no admin api.
 
-Put the public key of your hyperb identity in `operators` (in `garden.toml`). If you don't know it yet, open the address once: the server logs the key that tried and wasn't allowed, ready to be copied. Every request is signed by that key, and the interface doesn't exist while the list is empty.
+The first time, with no `operators` in `garden.toml`, garden logs a setup link like `hyperb://cdn.example.com/operator#setup=<secret>` (on a VPS: `journalctl -u garden | grep setup=`). Open it in hyperb: the key of your hyperb identity becomes the operator and is added to `operators` in `garden.toml`. The secret only travels in the fragment, which hyperb sends in the first message of the session and never in a URL; it works once, changes every time the server starts, and goes away once there is an operator.
 
-It has four tabs:
+After that, add more keys to `operators` by hand (`--operator` in the installer does it too). A key that tries and isn't listed is written to the log, ready to be copied. Every request is signed by the key that opened the session.
+
+It has five tabs:
 
 - **Audit**: checks the books (below) over the last 7, 30 or 90 days and lists what looks wrong.
 - **Books**: where you enter, if you want to, what happens outside the server: bills you paid to providers, sats you sold, the price of bitcoin and what each provider charges.
 - **Moderation**: uploaders of a file, files of an account, bans. Destructive actions ask for confirmation.
 - **Rent and orders**: take the day's rent now (it's idempotent), see orders waiting for their payment.
+- **Payments**: pick the Arkade server (mainnet, mutinynet for test money, or another one) and create or restore the wallet, see what it holds, show its seed to back it up. Until this is done nobody can pay. The wallet can't be changed while orders are waiting for their payment, and if `[payments]` is in `garden.toml` the tab only shows it.
 
 ## The books and the audit
 
@@ -56,6 +59,8 @@ See `garden.example.toml`. `[restrictions]` is where account/upload rules go (`R
 
 - The ledger needs nothing running: it is a file, `ledger.redb` in `data_dir` (or `path` in `[ledger]`).
 - For development use `kind = "memory"` for the ledger and `kind = "mock"` for payments; orders are then marked as paid in the operator interface.
+- To try it with real (test) payments, pick *Arkade, mutinynet* in the Payments tab. Any S3 server does for storage, e.g. SeaweedFS: `podman run -p 127.0.0.1:8333:8333 chrislusf/seaweedfs server -dir=/data -s3`, then a provider with `kind = "s3"`, `endpoint = "http://127.0.0.1:8333"` and `public_url = "http://127.0.0.1:8333/<bucket>"`.
+- The test against mutinynet itself is ignored by default: `cargo test -- --ignored mutinynet`.
 
 ## Deploying on a VPS
 
@@ -84,7 +89,7 @@ sudo bash install.sh --domain cdn.example.com --operator YOUR_HYPERB_PUBKEY_HEX
 The installer:
 
 - installs `garden` in `/opt/garden/bin`;
-- creates `/etc/garden/garden.toml` with a generated Arkade seed,
+- creates `/etc/garden/garden.toml` (payments are then set up in the operator interface),
   `listen = "127.0.0.1:3000"`, and `data_dir = "/var/lib/garden/data"`;
 - creates `/var/lib/garden`;
 - installs the `garden` systemd unit.
@@ -150,7 +155,7 @@ Open only ports 80 and 443. Do not expose 3000.
 
 Back up these together:
 
-- `/etc/garden/garden.toml` (Arkade seed and provider keys)
+- `/etc/garden/garden.toml` (provider keys, and the Arkade seed if `[payments]` is there)
 - `/var/lib/garden/data/garden.redb` (orders, bans, pending deletions)
 - `/var/lib/garden/data/ledger.redb` (accounts, files and every transfer)
 
@@ -160,7 +165,7 @@ and data, replaces the garden binary, and restarts garden. Never delete
 
 ## Things to know
 
-- Money received on Arkade stays in a wallet derived from `payments.seed` (one address per order). Back the seed up; to spend it, restore it in any Arkade wallet.
+- Money received on Arkade stays in a wallet derived from its seed (one address per order). Back the seed up (the Payments tab shows it); to spend it, restore it in any Arkade wallet on the same network.
 - An order credits exactly what it asked for. Overpayments are not credited: they are recorded as unclaimed, and so is the part of an order for a file that expired before it was paid (the order says `gone`). The audit shows the total, and it is yours to keep or return.
 - Uploading a file that is already alive is free and changes nothing.
 - Money received on an address after its order was settled is not in the ledger; the audit shows it as a difference with the wallet.

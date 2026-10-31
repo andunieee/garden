@@ -37,10 +37,16 @@ pub struct Config {
     #[serde(default)]
     pub ledger: LedgerConfig,
 
-    pub payments: PaymentsConfig,
+    /// when absent, payments are set up in the operator interface
+    #[serde(default)]
+    pub payments: Option<PaymentsConfig>,
 
     #[serde(default, rename = "provider")]
     pub providers: Vec<ProviderConfig>,
+
+    /// the file this was read from, where operators are added (see [add_operator])
+    #[serde(skip)]
+    pub path: Option<std::path::PathBuf>,
 }
 
 fn default_listen() -> String {
@@ -344,8 +350,9 @@ impl Config {
         let text = std::fs::read_to_string(path).map_err(|e| format!("reading {path}: {e}"))?;
         let mut config: Config = toml::from_str(&text).map_err(|e| format!("{path}: {e}"))?;
         config.public_url = config.public_url.trim_end_matches('/').to_string();
+        config.path = Some(path.into());
 
-        if let PaymentsConfig::Arkade { seed, .. } = &mut config.payments {
+        if let Some(PaymentsConfig::Arkade { seed, .. }) = &mut config.payments {
             if let Ok(s) = std::env::var("GARDEN_ARKADE_SEED") {
                 *seed = s;
             }
@@ -381,13 +388,40 @@ impl Config {
         if !self.providers.iter().any(|p| p.enabled && p.weight > 0) {
             return Err("at least one enabled provider is needed".into());
         }
-        if let PaymentsConfig::Arkade { seed, .. } = &self.payments {
+        if let Some(PaymentsConfig::Arkade { seed, .. }) = &self.payments {
             if seed.len() != 64 || lowercase_hex::decode(seed).is_err() {
                 return Err("payments.seed must be 32 bytes in hex".into());
             }
         }
         Ok(())
     }
+}
+
+/// adds an operator key to the `operators` of the config file, keeping everything else in it
+/// as it was. the file is replaced in one go, so it's never left half written.
+pub fn add_operator(path: &std::path::Path, key: &str) -> Result<(), String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e: toml_edit::TomlError| e.to_string())?;
+    let operators = doc
+        .entry("operators")
+        .or_insert_with(|| toml_edit::value(toml_edit::Array::new()))
+        .as_array_mut()
+        .ok_or("`operators` is not a list")?;
+    if !operators.iter().any(|k| k.as_str() == Some(key)) {
+        operators.push(key);
+    }
+
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+    let tmp = dir.join(format!(".garden-{:016x}.toml", rand::random::<u64>()));
+    let write = || -> std::io::Result<()> {
+        std::fs::write(&tmp, doc.to_string())?;
+        std::fs::set_permissions(&tmp, std::fs::metadata(path)?.permissions())?;
+        std::fs::rename(&tmp, path)
+    };
+    write().map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        e.to_string()
+    })
 }
 
 #[cfg(test)]

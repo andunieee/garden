@@ -17,6 +17,8 @@ LimitNOFILE=65536
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
+# the first operator is added to the config by garden itself
+ReadWritePaths=/etc/garden
 ProtectHome=true
 CapabilityBoundingSet=
 AmbientCapabilities=

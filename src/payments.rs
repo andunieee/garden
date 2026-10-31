@@ -42,6 +42,11 @@ pub trait Payments: Send + Sync {
         Ok(None)
     }
 
+    /// the bitcoin network the money is on ("bitcoin" for mainnet), if it is real
+    async fn network(&self) -> Result<Option<String>, PaymentError> {
+        Ok(None)
+    }
+
     /// pretend that money arrived. only the mock supports this.
     fn simulate(&self, _request: &PaymentRequest, _sats: u64) -> bool {
         false
@@ -49,6 +54,63 @@ pub trait Payments: Send + Sync {
 }
 
 pub type SharedPayments = Arc<dyn Payments>;
+
+/// the payments in use, which the operator can set up or change while we run. until then
+/// there are none, and no orders can be made.
+#[derive(Default)]
+pub struct Switch {
+    current: std::sync::RwLock<Option<SharedPayments>>,
+}
+
+impl Switch {
+    pub fn new(payments: Option<SharedPayments>) -> Self {
+        Self {
+            current: std::sync::RwLock::new(payments),
+        }
+    }
+
+    pub fn set(&self, payments: SharedPayments) {
+        *self.current.write().unwrap() = Some(payments);
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.current.read().unwrap().is_some()
+    }
+
+    fn get(&self) -> Result<SharedPayments, PaymentError> {
+        self.current
+            .read()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| PaymentError("payments are not set up yet".into()))
+    }
+}
+
+#[async_trait::async_trait]
+impl Payments for Switch {
+    async fn request(&self, order_id: &str) -> Result<PaymentRequest, PaymentError> {
+        self.get()?.request(order_id).await
+    }
+
+    async fn received(&self, request: &PaymentRequest) -> Result<u64, PaymentError> {
+        self.get()?.received(request).await
+    }
+
+    async fn wallet_balance(&self) -> Result<Option<u64>, PaymentError> {
+        match self.get() {
+            Ok(p) => p.wallet_balance().await,
+            Err(_) => Ok(None),
+        }
+    }
+
+    async fn network(&self) -> Result<Option<String>, PaymentError> {
+        self.get()?.network().await
+    }
+
+    fn simulate(&self, request: &PaymentRequest, sats: u64) -> bool {
+        self.get().is_ok_and(|p| p.simulate(request, sats))
+    }
+}
 
 #[derive(Default)]
 pub struct MockPayments {
@@ -199,6 +261,10 @@ pub mod arkade {
         }
     }
 
+    /// the arkd servers of arkade, by network
+    pub const MAINNET_URL: &str = ark_client::ARKADE_MAINNET_URL;
+    pub const MUTINYNET_URL: &str = ark_client::ARKADE_MUTINYNET_URL;
+
     pub struct Arkade {
         client: Client<NoChain, NoWallet, InMemorySwapStorage>,
     }
@@ -235,6 +301,15 @@ pub mod arkade {
         }
     }
 
+    /// a new random seed, in hex
+    pub fn new_seed() -> String {
+        lowercase_hex::encode(rand::random::<[u8; 32]>())
+    }
+
+    pub fn valid_seed(seed: &str) -> bool {
+        seed.len() == 64 && lowercase_hex::decode(seed).is_ok()
+    }
+
     #[async_trait::async_trait]
     impl Payments for Arkade {
         async fn request(&self, _order_id: &str) -> Result<PaymentRequest, PaymentError> {
@@ -261,6 +336,11 @@ pub mod arkade {
         async fn wallet_balance(&self) -> Result<Option<u64>, PaymentError> {
             let balance = self.client.offchain_balance().await.map_err(err)?;
             Ok(Some(balance.total().to_sat()))
+        }
+
+        /// what the server says it is on: "bitcoin" on mainnet, "signet" on mutinynet
+        async fn network(&self) -> Result<Option<String>, PaymentError> {
+            Ok(Some(self.client.server_info().await.map_err(err)?.network.to_string()))
         }
     }
 }

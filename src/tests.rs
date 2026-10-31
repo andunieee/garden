@@ -14,7 +14,7 @@ use tower::ServiceExt;
 use crate::app::{App, parse_hash};
 use crate::config::*;
 use crate::ledger::OrangeLedger;
-use crate::payments::{MockPayments, Payments};
+use crate::payments::{MockPayments, Payments, Switch};
 use crate::storage::{MemoryStorage, Providers};
 use crate::store::Store;
 
@@ -66,8 +66,9 @@ fn env_with(restrictions: Restrictions) -> Env {
         restrictions,
         pricing: Pricing::default(),
         ledger: LedgerConfig::Memory,
-        payments: PaymentsConfig::Mock,
+        payments: Some(PaymentsConfig::Mock),
         providers: vec![provider(1)],
+        path: None,
     };
     let storage = Arc::new(MemoryStorage::default());
     let payments = Arc::new(MockPayments::default());
@@ -75,7 +76,7 @@ fn env_with(restrictions: Restrictions) -> Env {
         config,
         Arc::new(OrangeLedger::in_memory().unwrap()),
         Providers::from_parts(vec![(1, 1, storage.clone())]),
-        payments.clone(),
+        Arc::new(Switch::new(Some(payments.clone()))),
         Arc::new(Store::temporary().unwrap()),
     );
     Env {
@@ -668,6 +669,101 @@ async fn the_operator_enters_the_books() {
 }
 
 #[tokio::test]
+async fn payments_are_set_up_in_the_operator_interface() {
+    let mut env = env();
+    let mut config = env.app.config.clone();
+    config.payments = None;
+    env.app = App::new(
+        config,
+        Arc::new(OrangeLedger::in_memory().unwrap()),
+        Providers::from_parts(vec![(1, 1, env.storage.clone())]),
+        Arc::new(Switch::default()),
+        Arc::new(Store::temporary().unwrap()),
+    );
+    env.router = crate::http::router(env.app.clone());
+
+    // nobody can pay until they are
+    let sk = SecretKey::generate();
+    assert_eq!(env.fund(&sk, 1000).await.status, StatusCode::BAD_GATEWAY);
+    assert_eq!(env.pay_for_files(json!({})).await.status, StatusCode::BAD_REQUEST);
+
+    let mut op = operator(&env).await;
+    let out = op.handle("hello {}\n").await;
+    assert!(out.contains("Payments are not set up"), "{out}");
+    assert!(out.contains("\"id\":\"pay_go\""), "{out}");
+
+    // mistakes are caught before anything is tried
+    let form = |server: &str, url: &str, wallet: &str, seed: &str| {
+        hyperb_action(
+            "ask_payments",
+            json!({ "payments": { "server": server, "url": url, "wallet": wallet, "seed": seed } }),
+            None,
+        )
+    };
+    assert!(op.handle(&form("custom", "ftp://x", "new", "")).await.contains("has to start with https://"));
+    assert!(op.handle(&form("mutinynet", "", "seed", "abc")).await.contains("A seed is 64 hex characters."));
+    assert!(op.handle(&form("mutinynet", "", "keep", "")).await.contains("There is no wallet yet."));
+    // a server that isn't there changes nothing
+    let out = op.handle(&form("custom", "http://127.0.0.1:9", "new", "")).await;
+    assert!(out.contains("\"kind\":\"failure\""), "{out}");
+    assert!(env.app.store.arkade().unwrap().is_none());
+    assert!(!env.app.payments.is_ready());
+}
+
+/// `cargo test -- --ignored mutinynet`
+#[tokio::test]
+#[ignore = "talks to arkade's mutinynet server"]
+async fn payments_on_mutinynet_from_the_operator_interface() {
+    let mut env = env();
+    let mut config = env.app.config.clone();
+    config.payments = None;
+    env.app = App::new(
+        config,
+        Arc::new(OrangeLedger::in_memory().unwrap()),
+        Providers::from_parts(vec![(1, 1, env.storage.clone())]),
+        Arc::new(Switch::default()),
+        Arc::new(Store::temporary().unwrap()),
+    );
+    env.router = crate::http::router(env.app.clone());
+    let mut op = operator(&env).await;
+
+    let form = json!({ "payments": { "server": "mutinynet", "url": "", "wallet": "new", "seed": "" } });
+    let out = op.handle(&hyperb_action("ask_payments", form, None)).await;
+    assert!(out.contains("Connected, on signet: test money."), "{out}");
+    assert!(out.contains("Taking payments (signet, test money); the wallet holds 0 sats."), "{out}");
+
+    let sk = SecretKey::generate();
+    let r = env
+        .json(
+            "POST",
+            "/api/account/credit",
+            &[("authorization", blossom::create_auth_header(&sk, ACCOUNT, &[], None, "", 60))],
+            json!({ "amount_sats": 1000 }),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);
+    assert!(r.body["payment"]["address"].as_str().unwrap().starts_with("tark1"), "{}", r.body);
+
+    // the seed is shown when asked for, and the wallet can't be changed while the order waits
+    let out = op.handle(&hyperb_action("confirmed", json!({ "confirm": { "action": "reveal", "arg": "" } }), None)).await;
+    assert!(out.contains(&env.app.store.arkade().unwrap().unwrap().seed), "{out}");
+    let form = json!({ "payments": { "server": "mutinynet", "url": "", "wallet": "new", "seed": "" } });
+    let out = op.handle(&hyperb_action("confirmed", json!({ "confirm": { "action": "payments", "arg": "" }, "payments": form["payments"] }), None)).await;
+    assert!(out.contains("1 orders are waiting"), "{out}");
+}
+
+#[tokio::test]
+async fn payments_in_the_config_file_are_not_changed_from_the_interface() {
+    let env = env();
+    let mut op = operator(&env).await;
+    let out = op.handle("hello {}\n").await;
+    assert!(out.contains("kind = \\\"mock\\\""), "{out}");
+    assert!(!out.contains("\"id\":\"pay_go\""), "{out}");
+    let settings = crate::store::ArkadeSettings { server_url: "https://x".into(), seed: "11".repeat(32) };
+    assert!(matches!(env.app.set_up_arkade(settings).await, Err(crate::app::AppError::BadRequest(_))));
+}
+
+#[tokio::test]
 async fn the_operator_moderates_and_runs_the_rent() {
     let env = env();
     let (evil, good) = (SecretKey::generate(), SecretKey::generate());
@@ -868,21 +964,78 @@ mod hyperb {
     }
 
     #[tokio::test]
-    async fn without_operators_the_interface_does_not_exist() {
+    async fn the_first_operator_comes_with_the_setup_link() {
+        let dir = std::env::temp_dir().join(format!("garden-setup-{:016x}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("garden.toml");
+        std::fs::write(&path, "# the comments stay\nlisten = \"127.0.0.1:3000\"\noperators = []\n").unwrap();
+
         let mut env = env();
         let mut config = env.app.config.clone();
         config.operators.clear();
+        config.public_url = "https://cdn.example.com".into();
+        config.path = Some(path.clone());
         env.app = App::new(
             config,
             Arc::new(OrangeLedger::in_memory().unwrap()),
             Providers::from_parts(vec![]),
-            Arc::new(MockPayments::default()),
+            Arc::new(Switch::new(Some(Arc::new(MockPayments::default())))),
             Arc::new(Store::temporary().unwrap()),
         );
         env.router = crate::http::router(env.app.clone());
-        assert_eq!(hello(&env, &operator_secret()).await.status(), StatusCode::NOT_FOUND);
-        let mut h = signed(&operator_secret(), "x");
+
+        // nobody gets in without the link
+        let (first, second) = (operator_secret(), ed25519_dalek::SigningKey::from_bytes(&[8; 32]));
+        assert_eq!(hello(&env, &first).await.status(), StatusCode::NOT_FOUND);
+        let link = env.app.setup_link().unwrap();
+        assert_eq!(env.app.setup_link().unwrap(), link, "it stays the same until it is used");
+        let (address, token) = link.split_once("#setup=").unwrap();
+        assert_eq!(address, "hyperb://cdn.example.com/operator");
+
+        let key = |k: &ed25519_dalek::SigningKey| lowercase_hex::encode(k.verifying_key().to_bytes());
+        let with = |token: &str| format!("hello {}\n", json!({ "params": { "setup": token } }));
+        assert_eq!(send(&env, "POST", &[("hyperb-key", key(&first))], &with("nope")).await.status(), StatusCode::FORBIDDEN);
+
+        // the first one to bring it is the operator, and is written down
+        let res = send(&env, "POST", &[("hyperb-key", key(&first))], &with(token)).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let mut h = signed(&first, &session_of(&res));
         h.push(("accept", "text/event-stream".into()));
-        assert_eq!(send(&env, "GET", &h, "").await.status(), StatusCode::NOT_FOUND);
+        let mut stream = send(&env, "GET", &h, "").await.into_body();
+        read_until(&mut stream, "You are the operator of this server now.").await;
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.starts_with("# the comments stay\n"), "{saved}");
+        let saved: toml::Table = toml::from_str(&saved).unwrap();
+        assert_eq!(saved["operators"].as_array().unwrap()[0].as_str().unwrap(), key(&first));
+
+        // and it doesn't work again
+        assert!(env.app.setup_link().is_none());
+        assert_eq!(send(&env, "POST", &[("hyperb-key", key(&second))], &with(token)).await.status(), StatusCode::FORBIDDEN);
+        assert_eq!(hello(&env, &first).await.status(), StatusCode::OK);
+        drop(stream);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn setup_links_use_the_scheme_hyperb_picks() {
+        let mut env = env();
+        for (public, link) in [
+            ("http://127.0.0.1:3000", "hyperb://127.0.0.1:3000/operator"),
+            ("http://localhost:3000", "hyperb://localhost:3000/operator"),
+            ("http://cdn.lan", "hyperb+http://cdn.lan/operator"),
+            ("https://cdn.example.com:8443", "hyperb://cdn.example.com:8443/operator"),
+        ] {
+            let mut config = env.app.config.clone();
+            config.operators.clear();
+            config.public_url = public.into();
+            env.app = App::new(
+                config,
+                Arc::new(OrangeLedger::in_memory().unwrap()),
+                Providers::from_parts(vec![]),
+                Arc::new(Switch::default()),
+                Arc::new(Store::temporary().unwrap()),
+            );
+            assert!(env.app.setup_link().unwrap().starts_with(&format!("{link}#setup=")), "{public}");
+        }
     }
 }

@@ -33,25 +33,38 @@ async fn build(config: Config) -> Result<Arc<App>, String> {
         }
     };
 
-    let payments: payments::SharedPayments = match &config.payments {
-        PaymentsConfig::Arkade { server_url, seed, .. } => {
-            Arc::new(payments::arkade::Arkade::connect(server_url, seed, store.clone()).await.map_err(|e| e.to_string())?)
-        }
-        PaymentsConfig::Mock => {
+    let payments: Option<payments::SharedPayments> = match &config.payments {
+        Some(PaymentsConfig::Arkade { server_url, seed, .. }) => Some(Arc::new(
+            payments::arkade::Arkade::connect(server_url, seed, store.clone()).await.map_err(|e| e.to_string())?,
+        )),
+        Some(PaymentsConfig::Mock) => {
             log::warn!("payments are fake, mark orders as paid in the operator interface");
-            Arc::new(payments::MockPayments::default())
+            Some(Arc::new(payments::MockPayments::default()))
         }
+        // set up in the operator interface, see [App::connect_payments]
+        None => None,
     };
+    let payments = Arc::new(payments::Switch::new(payments));
 
     let providers = storage::Providers::from_config(&config.providers).map_err(|e| e.to_string())?;
-    Ok(App::new(config, ledger, providers, payments, store))
+    let app = App::new(config, ledger, providers, payments, store);
+    app.connect_payments().await;
+    if !app.payments.is_ready() && app.store.arkade().ok().flatten().is_none() {
+        log::warn!("payments are not set up yet: do it in the operator interface (or [payments] in the config file)");
+    }
+    Ok(app)
 }
 
 /// look for payments, forever
 async fn watch_payments(app: Arc<App>, every: Duration) {
     let mut tick = tokio::time::interval(every);
+    let mut last_connect = std::time::Instant::now();
     loop {
         tick.tick().await;
+        if !app.payments.is_ready() && last_connect.elapsed() >= Duration::from_secs(60) {
+            last_connect = std::time::Instant::now();
+            app.connect_payments().await;
+        }
         app.check_waiting_orders().await;
     }
 }
@@ -95,13 +108,19 @@ async fn main() {
 
     let listen = config.listen.clone();
     let poll = match &config.payments {
-        PaymentsConfig::Arkade { poll_secs, .. } => Duration::from_secs((*poll_secs).max(1)),
-        PaymentsConfig::Mock => Duration::from_secs(2),
+        Some(PaymentsConfig::Arkade { poll_secs, .. }) => Duration::from_secs((*poll_secs).max(1)),
+        Some(PaymentsConfig::Mock) => Duration::from_secs(2),
+        None => Duration::from_secs(5),
     };
     let app = build(config).await.unwrap_or_else(|e| {
         eprintln!("couldn't start: {e}");
         std::process::exit(1);
     });
+
+    if let Some(link) = app.setup_link() {
+        log::warn!("this server has no operator yet. open this in hyperb to become it (it works once, and changes when the server restarts):");
+        log::warn!("{link}");
+    }
 
     tokio::spawn(watch_payments(app.clone(), poll));
     tokio::spawn(collect_rent(app.clone()));

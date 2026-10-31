@@ -133,7 +133,9 @@ if ! id -nG "$SERVICE_USER" | tr ' ' '\n' | grep -qx "$SERVICE_USER"; then
 fi
 
 install -d -m 0755 "$PREFIX" "$PREFIX/bin"
-install -d -m 0750 -o root -g "$SERVICE_USER" "$CONFIG_DIR"
+# garden adds the first operator to its config by itself (see the setup link below), and it
+# replaces the file in one go, so it has to be able to write in the directory
+install -d -m 0770 -o root -g "$SERVICE_USER" "$CONFIG_DIR"
 install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_USER" "$STATE_DIR" "$STATE_DIR/data"
 
 work="$(mktemp -d "${TMPDIR:-/tmp}/garden-install.XXXXXX")"
@@ -204,9 +206,6 @@ elif [[ ! -e "$config" ]]; then
         public_url="${public_url%/}"
         sed -i "0,/^public_url = .*/s|^public_url = .*|public_url = \"$public_url\"|" "$config"
     fi
-
-    seed="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
-    sed -i "s|^seed = .*|seed = \"$seed\"|" "$config"
 
     if (( ${#OPERATORS[@]} > 0 )); then
         ops=""
@@ -313,7 +312,6 @@ Finish the configuration first:
   1. edit $config
      - set public_url to the public https url
      - replace the provider bucket, endpoint, and credentials
-     - add your hyperb operator key to operators (optional)
   2. enable and start:
 
      systemctl enable --now garden.service
@@ -321,8 +319,21 @@ Finish the configuration first:
 EOF
 fi
 
+if ! grep -Eq '^operators = \[ *"' "$config"; then
+    cat <<EOF
+There is no operator yet. Once garden runs, it logs a setup link: open it in
+hyperb to become the operator (your key is then added to $config).
+
+  journalctl -u garden | grep 'setup='
+
+EOF
+fi
+
 cat <<EOF
-Back up $config (it holds the Arkade seed and provider keys) and $STATE_DIR.
+Set up payments in the Payments tab of the operator interface, at
+hyperb://<your server>/operator.
+Back up $config (provider keys) and $STATE_DIR (the ledger, and the Arkade seed if
+it was set up in the operator interface).
 Put a TLS reverse proxy in front of the server; an example is at
 $CONFIG_DIR/Caddyfile.example. Do not expose port 3000.
 EOF

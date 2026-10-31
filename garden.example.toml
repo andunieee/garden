@@ -6,7 +6,8 @@ data_dir = "./data"
 
 # who can use the operator interface: public keys (hex) of hyperb identities. open
 # hyperb://<your server>/operator in hyperb. a key that tries and isn't listed is written to
-# the log. leave empty to disable the interface.
+# the log. while this is empty, garden logs a setup link with a one-time secret: whoever opens
+# it first in hyperb becomes the operator, and their key is added here.
 operators = []
 
 # the money you pay the providers with, for the books and the audit
@@ -36,13 +37,16 @@ kind = "orangedb"
 # path = "./data/ledger.redb"   # the default is ledger.redb in data_dir
 # kind = "memory"   # development only, forgets everything on restart
 
-[payments]
-kind = "arkade"
-server_url = "https://arkade.computer"
-# 32 bytes in hex, or use the GARDEN_ARKADE_SEED environment variable. whoever has this seed
-# controls the money received, back it up.
-seed = "0000000000000000000000000000000000000000000000000000000000000001"
-poll_secs = 5
+# payments are set up in the operator interface (Payments tab), where you pick the arkade
+# server (mainnet, or mutinynet for test money) and create or restore the wallet. to fix them
+# here instead, uncomment this; the operator interface then only shows them.
+# [payments]
+# kind = "arkade"
+# server_url = "https://arkade.computer"      # or https://mutinynet.arkade.sh for test money
+# # 32 bytes in hex, or use the GARDEN_ARKADE_SEED environment variable. whoever has this seed
+# # controls the money received, back it up.
+# seed = "0000000000000000000000000000000000000000000000000000000000000001"
+# poll_secs = 5
 # kind = "mock"     # development only, orders are marked as paid in the operator interface
 
 # file hosting providers. new files go to a random enabled one (by weight), and each file is

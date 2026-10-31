@@ -8,12 +8,14 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use ritualistic::blossom::{self, BlobDescriptor};
 use serde::Serialize;
+use sha2::Digest;
 
 use crate::config::{Config, Denied};
 use crate::ledger::{self, Credited, FileInfo, Hash, LedgerError, SharedLedger};
-use crate::payments::SharedPayments;
+use crate::payments::{Payments, Switch};
+use crate::payments::arkade::Arkade;
 use crate::storage::Providers;
-use crate::store::{FileCredit, Order, OrderKind, OrderStatus, Store};
+use crate::store::{ArkadeSettings, FileCredit, Order, OrderKind, OrderStatus, Store};
 
 #[derive(thiserror::Error, Debug)]
 pub enum AppError {
@@ -105,7 +107,7 @@ pub struct App {
     pub config: Config,
     pub ledger: SharedLedger,
     pub providers: Providers,
-    pub payments: SharedPayments,
+    pub payments: Arc<Switch>,
     pub store: Arc<Store>,
     /// one at a time for each file when creating or expiring it
     locks: DashMap<Hash, Arc<tokio::sync::Mutex<()>>>,
@@ -114,6 +116,11 @@ pub struct App {
     /// bytes of the files people were sent to fetch, by day and provider, not saved yet
     redirected: DashMap<(u64, u32), u64>,
     pub(crate) sessions: crate::operator::transport::Sessions,
+    /// who may use the operator interface: `operators` from the config, and whoever claims it
+    /// with the setup link
+    operators: std::sync::RwLock<Vec<String>>,
+    /// the secret of the setup link, while there is no operator
+    setup_token: std::sync::Mutex<Option<String>>,
 }
 
 const SERVED_CACHE: Duration = Duration::from_secs(30);
@@ -147,10 +154,13 @@ impl App {
         config: Config,
         ledger: SharedLedger,
         providers: Providers,
-        payments: SharedPayments,
+        payments: Arc<Switch>,
         store: Arc<Store>,
     ) -> Arc<Self> {
+        let operators = config.operators.iter().map(|k| k.to_lowercase()).collect();
         Arc::new(Self {
+            operators: std::sync::RwLock::new(operators),
+            setup_token: Default::default(),
             config,
             ledger,
             providers,
@@ -242,6 +252,9 @@ impl App {
     }
 
     async fn new_order(&self, kind: OrderKind, amount_sats: u64) -> Result<Order> {
+        if !self.payments.is_ready() {
+            return Err(AppError::Unavailable("this server can't take payments yet".into()));
+        }
         let id = hex(&rand::random::<[u8; 16]>());
         let order = Order {
             payment: self.payments.request(&id).await?,
@@ -310,10 +323,129 @@ impl App {
         Ok(order)
     }
 
+    // operators
+
+    pub fn has_operators(&self) -> bool {
+        !self.operators.read().unwrap().is_empty()
+    }
+
+    pub fn is_operator(&self, key: &str) -> bool {
+        self.operators.read().unwrap().iter().any(|k| *k == key.to_lowercase())
+    }
+
+    /// while nobody runs the server, a link that makes whoever opens it first the operator.
+    /// it has a secret that changes every time we start and works once.
+    pub fn setup_link(&self) -> Option<String> {
+        if self.has_operators() {
+            return None;
+        }
+        let token = self
+            .setup_token
+            .lock()
+            .unwrap()
+            .get_or_insert_with(|| hex(&rand::random::<[u8; 32]>()))
+            .clone();
+        // hyperb picks http for ip addresses and localhost, https for everything else
+        let url = url::Url::parse(&self.config.public_url).ok()?;
+        let host = url.host_str()?;
+        let plain = url.scheme() == "http"
+            && !(host == "localhost" || host.ends_with(".localhost") || host.parse::<std::net::IpAddr>().is_ok()
+                || host.starts_with('['));
+        let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
+        let scheme = if plain { "hyperb+http" } else { "hyperb" };
+        Some(format!("{scheme}://{host}{port}/operator#setup={token}"))
+    }
+
+    /// the key that opened the setup link becomes the operator, and is added to the config
+    /// file. false if the token is wrong or someone did it already. what couldn't be saved is
+    /// said in the error.
+    pub fn claim_operator(&self, key: &str, token: &str) -> std::result::Result<bool, String> {
+        let mut setup = self.setup_token.lock().unwrap();
+        let same = setup.as_deref().is_some_and(|t| {
+            // compared as hashes, so the time it takes says nothing about the secret
+            let h = |s: &str| sha2::Sha256::digest(s.as_bytes());
+            h(t) == h(token)
+        });
+        if !same || self.has_operators() {
+            return Ok(false);
+        }
+        *setup = None;
+        let key = key.to_lowercase();
+        self.operators.write().unwrap().push(key.clone());
+        log::info!("{key} opened the setup link and is now the operator");
+        match &self.config.path {
+            Some(path) => crate::config::add_operator(path, &key)
+                .map(|_| true)
+                .map_err(|e| format!("couldn't add the key to {}: {e}", path.display())),
+            None => Ok(true),
+        }
+    }
+
+    // payments
+
+    /// the arkade wallet set up in the operator interface, if payments are not running yet.
+    /// called at startup, and again later in case the server couldn't be reached.
+    pub async fn connect_payments(&self) {
+        if self.config.payments.is_some() || self.payments.is_ready() {
+            return;
+        }
+        match self.store.arkade() {
+            Ok(Some(s)) => match Arkade::connect(&s.server_url, &s.seed, self.store.clone()).await {
+                Ok(a) => {
+                    log::info!("payments on arkade through {}", s.server_url);
+                    self.payments.set(Arc::new(a));
+                }
+                Err(e) => log::error!("couldn't connect to {}, will try again: {e}", s.server_url),
+            },
+            Ok(None) => {}
+            Err(e) => log::error!("{e}"),
+        }
+    }
+
+    /// orders paid to the current wallet that may still be paid
+    pub fn waiting_orders(&self) -> Result<Vec<Order>> {
+        let since = now().saturating_sub(self.config.restrictions.order_retention_hours * 3600);
+        Ok(self.store.waiting_orders(since)?)
+    }
+
+    /// use this arkade server and wallet from now on. it's connected to before anything is
+    /// saved, so nothing changes if it doesn't work. returns the network it is on.
+    pub async fn set_up_arkade(&self, settings: ArkadeSettings) -> Result<String> {
+        if self.config.payments.is_some() {
+            return Err(AppError::BadRequest(
+                "payments are set in the config file; remove [payments] there to set them up here".into(),
+            ));
+        }
+        if !crate::payments::arkade::valid_seed(&settings.seed) {
+            return Err(AppError::BadRequest("a seed is 32 bytes in hex".into()));
+        }
+        let current = self.store.arkade()?;
+        if current.as_ref() == Some(&settings) && self.payments.is_ready() {
+            return Err(AppError::BadRequest("that's what is in use already".into()));
+        }
+        // they are watched at the addresses of the wallet in use
+        let waiting = self.waiting_orders()?.len();
+        if current.is_some() && waiting > 0 {
+            return Err(AppError::BadRequest(format!(
+                "{waiting} orders are waiting for their payment at the current wallet; change it once they are paid or have expired"
+            )));
+        }
+
+        let connect = Arkade::connect(&settings.server_url, &settings.seed, self.store.clone());
+        let arkade = tokio::time::timeout(Duration::from_secs(30), connect)
+            .await
+            .map_err(|_| AppError::Unavailable(format!("{} didn't answer", settings.server_url)))??;
+        let network = arkade.network().await?.unwrap_or_default();
+
+        self.store.set_arkade(&settings)?;
+        self.payments.set(Arc::new(arkade));
+        log::info!("payments on arkade ({network}) through {}, set up by the operator", settings.server_url);
+        Ok(network)
+    }
+
     /// look for payments of all the orders that are waiting
     pub async fn check_waiting_orders(&self) {
-        let since = now().saturating_sub(self.config.restrictions.order_retention_hours * 3600);
-        let orders = match self.store.waiting_orders(since) {
+        let orders = match self.waiting_orders() {
             Ok(o) => o,
             Err(e) => return log::error!("{e}"),
         };

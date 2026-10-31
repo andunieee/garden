@@ -15,7 +15,9 @@ use hypereffect::{Action, Element, Handler, Outbox, RendererMessage, Value, cel,
 use crate::app::{App, AppError, Result, now, parse_hash, parse_pubkey};
 use crate::audit::{Audit, Level};
 use crate::config::{PaymentsConfig, ProviderConfig};
-use crate::store::{OrderKind, ProviderPrices};
+use crate::payments::Payments;
+use crate::payments::arkade::{self, MAINNET_URL, MUTINYNET_URL};
+use crate::store::{ArkadeSettings, OrderKind, ProviderPrices};
 
 const ROWS: usize = 12;
 
@@ -28,6 +30,9 @@ pub struct OperatorSession {
     found_rows: Vec<String>,
     ban_rows: Vec<String>,
     order_rows: Vec<String>,
+    pay_rows: Vec<String>,
+    /// the operator asked to see the seed of the wallet
+    seed_shown: bool,
 }
 
 /// what the select menus show
@@ -136,7 +141,16 @@ impl OperatorSession {
             found_rows: vec![],
             ban_rows: vec![],
             order_rows: vec![],
+            pay_rows: vec![],
+            seed_shown: false,
         }
+    }
+
+    /// a line that shows a notice at the top
+    pub fn notice(kind: &str, text: &str) -> String {
+        let mut out = Outbox::new();
+        say(&mut out, kind, text);
+        out.take()
     }
 
     /// the lines the renderer sent, and what the interface does about them
@@ -178,6 +192,7 @@ impl OperatorSession {
             },
             "confirm": {"open": false, "text": "", "action": "", "arg": ""},
         }));
+        out.signal(self.payments_signals());
 
         out.element(ui::column("main"));
         out.element(ui::text("title").parent("main").variant("h1").text("garden"));
@@ -279,6 +294,58 @@ impl OperatorSession {
         out.element(ui::button("ops_orders").parent("ops_buttons").label("Show waiting orders").on_press(Handler::action("orders")));
         out.element(ui::card("orders_card").parent("ops_tab").title("Orders waiting for their payment"));
 
+        // payments
+        out.element(ui::tab("pay_tab").parent("tabs").label("Payments"));
+        out.element(ui::column("pay_status").parent("pay_tab"));
+        if app.config.payments.is_none() {
+            out.element(ui::card("pay_card").parent("pay_tab").title("Arkade"));
+            out.element(
+                ui::select("pay_server")
+                    .parent("pay_card")
+                    .label("Server")
+                    .bind("payments.server")
+                    .options(cel("s.menu.servers")),
+            );
+            out.element(
+                ui::input("pay_url")
+                    .parent("pay_card")
+                    .label("Server URL")
+                    .placeholder("https://arkd.example.com")
+                    .bind("payments.url")
+                    .visible(cel("s.payments.server == 'custom'")),
+            );
+            out.element(
+                ui::select("pay_wallet")
+                    .parent("pay_card")
+                    .label("Wallet")
+                    .bind("payments.wallet")
+                    .options(cel("s.menu.wallets")),
+            );
+            out.element(
+                ui::input("pay_seed")
+                    .parent("pay_card")
+                    .label("Seed (64 hex characters)")
+                    .bind("payments.seed")
+                    .visible(cel("s.payments.wallet == 'seed'")),
+            );
+            out.element(ui::row("pay_buttons").parent("pay_card").wrap(true));
+            out.element(
+                ui::button("pay_go")
+                    .parent("pay_buttons")
+                    .label("Save and connect")
+                    .variant("primary")
+                    .on_press(Handler::action("ask_payments").indicator("_busy")),
+            );
+            out.element(
+                ui::button("pay_reveal")
+                    .parent("pay_buttons")
+                    .label("Show the seed")
+                    .visible(cel("s.payments.configured"))
+                    .on_press(Handler::action("ask_reveal")),
+            );
+            out.element(ui::progress("pay_busy").parent("pay_card").variant("spinner").visible(cel("_busy == true")));
+        }
+
         // are you sure
         out.element(
             ui::dialog("confirm")
@@ -297,6 +364,7 @@ impl OperatorSession {
         );
         out.element(ui::button("confirm_no").parent("confirm_buttons").label("Cancel").variant("plain").on_press(Handler::patch(close)));
 
+        self.show_payments(out).await;
         if let Err(e) = self.show_entries(out).await.and(self.show_bans(out)).and(self.show_orders(out)) {
             say(out, "failure", e.to_string());
         }
@@ -319,6 +387,16 @@ impl OperatorSession {
             "sweep" => self.sweep(out).await,
             "orders" => self.show_orders(out),
             "mock_paid" => self.mock_paid(out, a).await,
+            "ask_payments" => self.ask_payments(out, a).await,
+            "ask_reveal" => {
+                Self::ask(
+                    out,
+                    "The seed will be on the screen. Whoever sees it can take the money in the wallet.".into(),
+                    "reveal",
+                    String::new(),
+                );
+                Ok(())
+            }
             _ => Ok(()),
         };
         if let Err(e) = done {
@@ -674,6 +752,12 @@ impl OperatorSession {
                     if purged.is_empty() { "Banned.".to_string() } else { format!("Banned, and {} files removed.", purged.len()) },
                 );
             }
+            "payments" => return self.save_payments(out, a).await,
+            "reveal" => {
+                self.seed_shown = true;
+                self.show_payments(out).await;
+                return Ok(());
+            }
             _ => return Ok(()),
         }
         self.show_bans(out)
@@ -718,7 +802,7 @@ impl OperatorSession {
         let since = now().saturating_sub(self.app.config.restrictions.order_retention_hours * 3600);
         let mut orders = self.app.store.waiting_orders(since)?;
         orders.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-        let mock = matches!(self.app.config.payments, PaymentsConfig::Mock);
+        let mock = matches!(self.app.config.payments, Some(PaymentsConfig::Mock));
 
         let mut rows = vec![];
         for (i, o) in orders.iter().take(ROWS).enumerate() {
@@ -754,5 +838,163 @@ impl OperatorSession {
         self.app.confirm_mock(&id).await?;
         say(out, "success", "Marked as paid.");
         self.show_orders(out)
+    }
+
+    // payments
+
+    fn payments_signals(&self) -> Value {
+        let current = self.app.store.arkade().ok().flatten();
+        let (server, url) = match current.as_ref().map(|s| s.server_url.as_str()) {
+            None | Some(MUTINYNET_URL) => ("mutinynet", String::new()),
+            Some(MAINNET_URL) => ("mainnet", String::new()),
+            Some(other) => ("custom", other.to_string()),
+        };
+        let mut wallets = vec![];
+        if current.is_some() {
+            wallets.push(("keep".to_string(), "Keep this wallet".to_string()));
+        }
+        wallets.push(("new".into(), "A new wallet".into()));
+        wallets.push(("seed".into(), "A seed I have".into()));
+        json!({
+            "payments": {
+                "server": server,
+                "url": url,
+                "wallet": if current.is_some() { "keep" } else { "new" },
+                "seed": "",
+                "configured": current.is_some(),
+            },
+            "menu": {
+                "servers": menu(&[
+                    ("mainnet".into(), "Arkade, mainnet (real money)".into()),
+                    ("mutinynet".into(), "Arkade, mutinynet (test money)".into()),
+                    ("custom".into(), "Another server".into()),
+                ]),
+                "wallets": menu(&wallets),
+            },
+        })
+    }
+
+    async fn show_payments(&mut self, out: &mut Outbox) {
+        let app = self.app.clone();
+        let mut lines: Vec<(&str, String)> = vec![];
+        let stored = app.store.arkade().ok().flatten();
+        match (&app.config.payments, &stored) {
+            (Some(PaymentsConfig::Mock), _) => {
+                lines.push(("warning", "Payments are fake (kind = \"mock\" in the config file): orders are marked as paid by hand.".into()));
+            }
+            (Some(PaymentsConfig::Arkade { server_url, .. }), _) => {
+                lines.push(("info", format!("Arkade through {server_url}, as the config file says. To set payments up here instead, remove [payments] from it.")));
+            }
+            (None, Some(s)) => lines.push(("info", format!("Arkade through {}.", s.server_url))),
+            (None, None) => lines.push((
+                "warning",
+                "Payments are not set up, so nobody can pay yet. Pick a server and a wallet below: mutinynet is for trying everything out with test money.".into(),
+            )),
+        }
+        if app.payments.is_ready() {
+            let network = match app.payments.network().await {
+                Ok(Some(n)) if n == "bitcoin" => "mainnet, real money".to_string(),
+                Ok(Some(n)) => format!("{n}, test money"),
+                Ok(None) => "no network".to_string(),
+                Err(e) => format!("the server didn't say: {e}"),
+            };
+            let balance = match app.payments.wallet_balance().await {
+                Ok(Some(b)) => format!("the wallet holds {}", sats(b)),
+                Ok(None) => "the wallet can't be read".into(),
+                Err(e) => format!("the wallet can't be read: {e}"),
+            };
+            lines.push(("success", format!("Taking payments ({network}); {balance}.")));
+        } else if stored.is_some() {
+            lines.push(("failure", "The server can't be reached; it is tried again every minute.".into()));
+        }
+
+        let mut rows = vec![];
+        for (i, (kind, text)) in lines.into_iter().enumerate() {
+            rows.push(ui::notice(format!("pay_line_{i}")).parent("pay_status").variant(kind).text(text));
+        }
+        if self.seed_shown
+            && let Some(s) = &stored
+        {
+            rows.push(ui::card("pay_seed_card").parent("pay_status").title("The seed of the wallet"));
+            rows.push(ui::text("pay_seed_value").parent("pay_seed_card").variant("code").text(s.seed.clone()));
+            rows.push(
+                ui::text("pay_seed_help")
+                    .parent("pay_seed_card")
+                    .variant("caption")
+                    .text("Keep it somewhere safe. It restores the wallet in any Arkade wallet app, on the same network."),
+            );
+        }
+        replace(out, &mut self.pay_rows, rows);
+    }
+
+    /// the settings as the form has them
+    fn payments_form(&self, a: &Action) -> Result<(ArkadeSettings, bool)> {
+        let server_url = match text(a, "payments.server").as_str() {
+            "mainnet" => MAINNET_URL.to_string(),
+            "mutinynet" => MUTINYNET_URL.to_string(),
+            _ => {
+                let url = text(a, "payments.url").trim_end_matches('/').to_string();
+                if !url.starts_with("https://") && !url.starts_with("http://") {
+                    return Err(bad("The server URL has to start with https://"));
+                }
+                url
+            }
+        };
+        let (seed, new) = match text(a, "payments.wallet").as_str() {
+            "keep" => (
+                self.app.store.arkade()?.ok_or_else(|| bad("There is no wallet yet."))?.seed,
+                false,
+            ),
+            "seed" => {
+                let seed = text(a, "payments.seed").to_lowercase();
+                if !arkade::valid_seed(&seed) {
+                    return Err(bad("A seed is 64 hex characters."));
+                }
+                (seed, false)
+            }
+            _ => (arkade::new_seed(), true),
+        };
+        Ok((ArkadeSettings { server_url, seed }, new))
+    }
+
+    /// changing a wallet that is in use is asked about first
+    async fn ask_payments(&mut self, out: &mut Outbox, a: &Action) -> Result<()> {
+        let (wanted, _) = self.payments_form(a)?;
+        let Some(current) = self.app.store.arkade()? else {
+            return self.save_payments(out, a).await;
+        };
+        let mut what = vec![];
+        if wanted.server_url != current.server_url {
+            what.push(format!("New payments will go through {} instead of {}.", wanted.server_url, current.server_url));
+        }
+        if text(a, "payments.wallet") != "keep" {
+            what.push(
+                "New payments will go to another wallet. What the current one holds stays there: you need its seed to take it out, so make sure you have it.".into(),
+            );
+        }
+        if what.is_empty() {
+            return Err(bad("Nothing changes."));
+        }
+        Self::ask(out, what.join(" "), "payments", String::new());
+        Ok(())
+    }
+
+    async fn save_payments(&mut self, out: &mut Outbox, a: &Action) -> Result<()> {
+        let (settings, new) = self.payments_form(a)?;
+        let network = self.app.set_up_arkade(settings).await?;
+        self.seed_shown = false;
+        let real = network == "bitcoin";
+        say(
+            out,
+            "success",
+            format!(
+                "Connected, on {}.{}",
+                if real { "mainnet: these are real sats".to_string() } else { format!("{network}: test money") },
+                if new { " This is a new wallet: press Show the seed and write it down, it's the only way to get the money out." } else { "" },
+            ),
+        );
+        out.signal(self.payments_signals());
+        self.show_payments(out).await;
+        Ok(())
     }
 }

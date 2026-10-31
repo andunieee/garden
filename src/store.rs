@@ -95,6 +95,15 @@ pub struct Rate {
     pub set_at: u64,
 }
 
+/// the arkade wallet set up in the operator interface (when `[payments]` is not in the config
+/// file). whoever has the seed has the money.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ArkadeSettings {
+    pub server_url: String,
+    /// 32 bytes in hex
+    pub seed: String,
+}
+
 /// what a provider charges, in minor units of fiat. both are optional.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
 pub struct ProviderPrices {
@@ -281,6 +290,14 @@ impl Store {
 
     pub fn set_rate(&self, rate: Rate) -> Result<()> {
         self.set_setting("rate", &rate)
+    }
+
+    pub fn arkade(&self) -> Result<Option<ArkadeSettings>> {
+        self.setting("arkade")
+    }
+
+    pub fn set_arkade(&self, settings: &ArkadeSettings) -> Result<()> {
+        self.set_setting("arkade", settings)
     }
 
     pub fn prices(&self, provider: u32) -> Result<Option<ProviderPrices>> {
