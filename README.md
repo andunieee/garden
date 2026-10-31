@@ -54,9 +54,113 @@ See `garden.example.toml`. `[restrictions]` is where account/upload rules go (`R
 
 ## Running the pieces
 
-- TigerBeetle: `tigerbeetle format --cluster=0 --replica=0 --replica-count=1 0_0.tigerbeetle && tigerbeetle start --addresses=3001 0_0.tigerbeetle`. The client is pinned to `0.17.9`, run the same server version.
+- TigerBeetle: `tigerbeetle format --cluster=0 --replica=0 --replica-count=1 0_0.tigerbeetle && tigerbeetle start --addresses=127.0.0.1:3001 0_0.tigerbeetle`. The client is pinned to `0.17.9`, run the same server version.
 - The test for the TigerBeetle ledger needs a running server: see `src/ledger/tigerbeetle.rs`.
 - For development use `kind = "memory"` for the ledger and `kind = "mock"` for payments; orders are then marked as paid in the operator interface.
+
+## Deploying on a VPS
+
+Pushing a `v*` tag (`git tag v0.1.0 && git push origin v0.1.0`) runs
+`.github/workflows/release.yml`, which builds
+`garden-<target>.tar.gz` and publishes it with `install.sh` and checksums on the
+GitHub release. The tarball contains the binary, the example config, the systemd
+units, the Caddyfile example, and the installer.
+
+Supported targets:
+
+- `x86_64-unknown-linux-gnu`: Ubuntu 22.04+, Debian 12+, or anything with glibc 2.35+
+- `aarch64-unknown-linux-gnu`: an arm64 system with glibc 2.39+ (the GitHub arm64 runner is Ubuntu 24.04)
+
+### Install
+
+Download the installer, look at it, then run it with your own public hostname
+(the `cdn.example.com` below is only a placeholder):
+
+```bash
+curl -fsSLO https://github.com/andunieee/garden/releases/latest/download/install.sh
+less install.sh
+sudo bash install.sh --domain cdn.example.com --operator YOUR_HYPERB_PUBKEY_HEX
+```
+
+The installer:
+
+- installs `garden` in `/opt/garden/bin`;
+- downloads TigerBeetle `0.17.9`, verifies its checksum, and installs it next to garden;
+- creates `/etc/garden/garden.toml` with a generated Arkade seed and a random
+  nonzero TigerBeetle cluster id, `listen = "127.0.0.1:3000"`, and
+  `data_dir = "/var/lib/garden/data"`;
+- creates `/var/lib/garden` and formats `0_0.tigerbeetle` once, only if it is absent;
+- installs the `garden` and `tigerbeetle` systemd units.
+
+It will not enable or start the services while `public_url` is still
+`https://cdn.example.com` or the example provider credentials are still in the
+config. Finish the config first:
+
+```bash
+sudoedit /etc/garden/garden.toml   # set public_url and the provider credentials
+sudo systemctl enable --now tigerbeetle.service garden.service
+```
+
+To deploy a config you already prepared, pass it in; the installer keeps a
+timestamped backup of any config it replaces and starts the services:
+
+```bash
+sudo bash install.sh --config ./garden.toml
+```
+
+Other options: `--no-start` installs without starting the services, and
+`--version v0.1.0` pins a release instead of using the latest one. The installer
+is idempotent and keeps an existing `/etc/garden/garden.toml` and
+`/var/lib/garden` on upgrades.
+
+### TLS and the reverse proxy
+
+garden speaks HTTP only. Put Caddy or nginx in front of it, terminate TLS there,
+and forward to `127.0.0.1:3000`. The `public_url` in the config must be the exact
+public URL, because the Blossom auth check uses its host.
+
+An example Caddyfile is installed at `/etc/garden/Caddyfile.example`:
+
+```caddyfile
+cdn.example.com {
+	request_body {
+		max_size 110MB
+	}
+	reverse_proxy 127.0.0.1:3000
+}
+```
+
+The body limit must be at least `restrictions.max_file_size`. With nginx, also
+set `proxy_request_buffering off` and a long `proxy_read_timeout`, and raise
+`client_max_body_size`; otherwise large uploads fail before they reach garden.
+
+Open only ports 80 and 443. Do not expose 3000 or 3001.
+
+### What the VPS needs
+
+- Outbound HTTPS to `arkade.computer` and to the S3/B2/R2 endpoints.
+- A working clock (NTP); rent is charged per Unix day.
+- At least 2 GB free disk. TigerBeetle preallocates a ~1.1 GiB data file,
+  before `garden.redb` and the rest of the system. Keep `/var/lib/garden` on a
+  local filesystem that supports io_uring and `O_DIRECT`, not on NFS.
+- Enough RAM for in-flight uploads: each upload is buffered up to
+  `restrictions.max_file_size` while it is hashed, so 100 MiB uploads need
+  headroom beyond the base process and TigerBeetle cache.
+- Provider buckets whose `public_url` is publicly readable, because serving a
+  blob is a redirect to the provider.
+
+### Backups and upgrades
+
+Back up these together:
+
+- `/etc/garden/garden.toml` (Arkade seed and provider keys)
+- `/var/lib/garden/data/garden.redb` (orders, bans, pending deletions)
+- `/var/lib/garden/0_0.tigerbeetle` (accounts and files)
+
+To upgrade, run the installer again from the new release. It keeps the config
+and data, replaces the garden binary, and restarts garden. It does not restart a
+running TigerBeetle. Never delete `0_0.tigerbeetle`, and never run
+`tigerbeetle format` on an existing ledger file.
 
 ## Things to know
 

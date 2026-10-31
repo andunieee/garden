@@ -33,6 +33,7 @@ min_days = 30
 
 [ledger]
 kind = "tigerbeetle"
+# 0 is reserved for testing; the VPS installer generates a random nonzero id
 cluster_id = 0
 addresses = "127.0.0.1:3001"
 # kind = "memory"   # development only, forgets everything on restart

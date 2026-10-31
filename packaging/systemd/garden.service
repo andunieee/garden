@@ -1,0 +1,28 @@
+[Unit]
+Description=garden blossom server
+Documentation=https://github.com/andunieee/garden
+After=network-online.target tigerbeetle.service
+Wants=network-online.target
+Requires=tigerbeetle.service
+
+[Service]
+Type=simple
+User=garden
+Group=garden
+WorkingDirectory=/var/lib/garden
+EnvironmentFile=-/etc/garden/garden.env
+ExecStart=/opt/garden/bin/garden /etc/garden/garden.toml
+Restart=always
+RestartSec=2
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

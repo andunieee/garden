@@ -1,0 +1,16 @@
+# Example Caddy front end for garden.
+#
+# Replace cdn.example.com with the same host you put in public_url in
+# /etc/garden/garden.toml. Caddy gets the certificate automatically.
+#
+# Caddy does not limit request bodies by default; max_size is set here so it
+# cannot be lower than restrictions.max_file_size.
+
+cdn.example.com {
+	request_body {
+		# max_file_size is 100 MiB; leave headroom over the request limit.
+		max_size 110MB
+	}
+
+	reverse_proxy 127.0.0.1:3000
+}

@@ -1,0 +1,99 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Build x86_64 on 22.04 so the binary only needs glibc 2.35.
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          # GitHub's arm64 hosted runner is Ubuntu 24.04, so this artifact
+          # needs glibc 2.39 or newer.
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.91.0"
+          targets: ${{ matrix.target }}
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+
+      - name: Package
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+
+          stage="stage-$TARGET"
+          rm -rf "$stage"
+          mkdir -p "$stage/systemd"
+
+          install -m 0755 "target/$TARGET/release/garden" "$stage/garden"
+          install -m 0644 garden.example.toml README.md "$stage/"
+          install -m 0755 install.sh "$stage/install.sh"
+          install -m 0644 packaging/systemd/garden.service \
+            packaging/systemd/tigerbeetle.service "$stage/systemd/"
+          install -m 0644 packaging/Caddyfile.example "$stage/Caddyfile.example"
+
+          strip "$stage/garden" || true
+
+          asset="garden-$TARGET.tar.gz"
+          tar -czf "$asset" -C "$stage" .
+          sha256sum "$asset" > "$asset.sha256"
+          cat "$asset.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: garden-${{ matrix.target }}
+          path: |
+            garden-${{ matrix.target }}.tar.gz
+            garden-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    name: publish
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List release files
+        run: ls -lh dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/garden-*.tar.gz
+            dist/garden-*.tar.gz.sha256
+            install.sh
+          generate_release_notes: true
