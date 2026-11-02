@@ -38,6 +38,7 @@ pub struct Integrity {
     pub in_files: u64,
     pub earned: u64,
     pub unclaimed: u64,
+    pub withdrawn: u64,
     /// received - everything above, which is zero unless something is very wrong
     pub difference: i64,
 }
@@ -157,7 +158,9 @@ pub fn compute(i: Inputs) -> Audit {
 
     // the ledger against itself
     let in_files: u64 = i.files.iter().map(|f| f.balance).sum();
-    let difference = clamp(t.received as i128 - (i.in_accounts + in_files + t.earned + t.unclaimed) as i128);
+    let difference = clamp(
+        t.received as i128 - (i.in_accounts + in_files + t.earned + t.unclaimed + t.withdrawn) as i128,
+    );
     if difference != 0 {
         warn(
             Level::Failure,
@@ -173,7 +176,7 @@ pub fn compute(i: Inputs) -> Audit {
 
     // the ledger against the wallet
     let wallet = i.wallet.map(|actual| {
-        let expected = (t.received as i128 - t.sold as i128 + i.waiting_for_orders as i128).max(0) as u64;
+        let expected = (t.received as i128 - t.sold as i128 - t.withdrawn as i128 + i.waiting_for_orders as i128).max(0) as u64;
         let difference = clamp(actual as i128 - expected as i128);
         match difference {
             0 => {}
@@ -183,7 +186,7 @@ pub fn compute(i: Inputs) -> Audit {
             ),
             d => warn(
                 Level::Failure,
-                format!("The wallet holds {} sats less than the books say. Either sats left it that weren't recorded as sold, or they are gone (fees count).", -d),
+                format!("The wallet holds {} sats less than the books say. Either sats left it that weren't recorded as sold or sent, or they are gone (fees count).", -d),
             ),
         }
         WalletCheck {
@@ -199,7 +202,7 @@ pub fn compute(i: Inputs) -> Audit {
     if unsold < 0 {
         warn(
             Level::Failure,
-            format!("{} more sats were recorded as sold than rent has ever earned.", -unsold),
+            format!("{} more sats were recorded as sold or sent than rent has ever earned.", -unsold),
         );
     }
     let fiat_on_hand = clamp(t.fiat_in as i128 - t.fiat_out as i128);
@@ -209,7 +212,7 @@ pub fn compute(i: Inputs) -> Audit {
             format!("Bills paid add up to {} more than the sats sold brought in: the difference came from elsewhere.", fiat(-fiat_on_hand)),
         );
     }
-    let realized = (t.sold > 0).then(|| (t.fiat_in as i128 * SATS_PER_BTC / t.sold as i128) as u64);
+    let realized = (t.converted > 0).then(|| (t.fiat_in as i128 * SATS_PER_BTC / t.converted as i128) as u64);
     let (rate, rate_source, rate_set_at) = match (i.rate, realized) {
         (Some(r), _) => (Some(r.fiat_minor_per_btc), Some("operator"), Some(r.set_at)),
         (None, Some(r)) => (Some(r), Some("realized"), None),
@@ -381,6 +384,7 @@ pub fn compute(i: Inputs) -> Audit {
             in_files,
             earned: t.earned,
             unclaimed: t.unclaimed,
+            withdrawn: t.withdrawn,
             difference,
         },
         wallet,
@@ -477,6 +481,8 @@ mod tests {
                 received: 1000,
                 earned: 450,
                 sold: 100,
+                converted: 100,
+                withdrawn: 0,
                 unclaimed: 50,
                 fiat_in: 5000,
                 fiat_out: 700,

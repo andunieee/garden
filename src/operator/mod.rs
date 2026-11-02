@@ -15,6 +15,7 @@ use hypereffect::{Action, Element, Handler, Outbox, RendererMessage, Value, cel,
 use crate::app::{App, AppError, Result, now, parse_hash, parse_pubkey};
 use crate::audit::{Audit, Level};
 use crate::config::{PaymentsConfig, ProviderConfig};
+use crate::ledger::WithdrawalFrom;
 use crate::payments::Payments;
 use crate::payments::arkade::{self, MAINNET_URL, MUTINYNET_URL};
 use crate::store::{ArkadeSettings, OrderKind, ProviderPrices};
@@ -31,6 +32,7 @@ pub struct OperatorSession {
     ban_rows: Vec<String>,
     order_rows: Vec<String>,
     pay_rows: Vec<String>,
+    wallet_rows: Vec<String>,
     /// the operator asked to see the seed of the wallet
     seed_shown: bool,
 }
@@ -142,6 +144,7 @@ impl OperatorSession {
             ban_rows: vec![],
             order_rows: vec![],
             pay_rows: vec![],
+            wallet_rows: vec![],
             seed_shown: false,
         }
     }
@@ -186,9 +189,15 @@ impl OperatorSession {
             "rate": {"value": ""},
             "prices": {"provider": first, "storage": "", "egress": ""},
             "mod": {"hash": "", "pubkey": "", "purge": false},
+            "wallet": {"from": "revenue", "account": "", "amount": "", "address": "", "note": ""},
             "menu": {
                 "providers": menu(&providers),
                 "days": menu(&[("7".into(), "Last 7 days".into()), ("30".into(), "Last 30 days".into()), ("90".into(), "Last 90 days".into())]),
+                "wallet_from": menu(&[
+                    ("revenue".into(), "Earnings (rent not sold yet)".into()),
+                    ("suspense".into(), "Unclaimed sats".into()),
+                    ("user".into(), "An account".into()),
+                ]),
             },
             "confirm": {"open": false, "text": "", "action": "", "arg": ""},
         }));
@@ -346,6 +355,87 @@ impl OperatorSession {
             out.element(ui::progress("pay_busy").parent("pay_card").variant("spinner").visible(cel("_busy == true")));
         }
 
+        // wallet
+        out.element(ui::tab("wallet_tab").parent("tabs").label("Wallet"));
+        out.element(ui::column("wallet_status").parent("wallet_tab"));
+
+        out.element(ui::card("wallet_send_card").parent("wallet_tab").title("Send sats out of the wallet"));
+        out.element(
+            ui::select("wallet_from")
+                .parent("wallet_send_card")
+                .label("Take them from")
+                .bind("wallet.from")
+                .options(cel("s.menu.wallet_from")),
+        );
+        out.element(
+            ui::input("wallet_account")
+                .parent("wallet_send_card")
+                .label("Account (pubkey in hex)")
+                .bind("wallet.account")
+                .visible(cel("s.wallet.from == 'user'")),
+        );
+        out.element(
+            ui::input("wallet_amount")
+                .parent("wallet_send_card")
+                .label("Amount (sats)")
+                .bind("wallet.amount"),
+        );
+        out.element(
+            ui::input("wallet_address")
+                .parent("wallet_send_card")
+                .label("Ark address")
+                .placeholder("tark1… or ark1…")
+                .bind("wallet.address"),
+        );
+        out.element(
+            ui::input("wallet_note")
+                .parent("wallet_send_card")
+                .label("Note (a new note sends the same amount again)")
+                .bind("wallet.note"),
+        );
+        out.element(ui::row("wallet_send_buttons").parent("wallet_send_card").wrap(true));
+        out.element(
+            ui::button("wallet_send")
+                .parent("wallet_send_buttons")
+                .label("Review the send")
+                .variant("primary")
+                .on_press(Handler::action("ask_send")),
+        );
+        out.element(ui::progress("wallet_busy").parent("wallet_send_card").variant("spinner").visible(cel("_busy == true")));
+
+        out.element(ui::card("wallet_grant_card").parent("wallet_tab").title("Give unclaimed sats to an account"));
+        out.element(
+            ui::text("wallet_grant_help").parent("wallet_grant_card").variant("caption").text(
+                "This moves sats between accounts in the books; nothing leaves the wallet. Use it to return an overpayment.",
+            ),
+        );
+        out.element(
+            ui::input("wallet_grant_account")
+                .parent("wallet_grant_card")
+                .label("Account (pubkey in hex)")
+                .bind("wallet.grant_account"),
+        );
+        out.element(
+            ui::input("wallet_grant_amount")
+                .parent("wallet_grant_card")
+                .label("Amount (sats)")
+                .bind("wallet.grant_amount"),
+        );
+        out.element(
+            ui::input("wallet_grant_note")
+                .parent("wallet_grant_card")
+                .label("Note")
+                .bind("wallet.grant_note"),
+        );
+        out.element(
+            ui::button("wallet_grant")
+                .parent("wallet_grant_card")
+                .label("Review the grant")
+                .on_press(Handler::action("ask_grant")),
+        );
+
+        out.element(ui::card("wallet_sends_card").parent("wallet_tab").title("Recent sends"));
+
         // are you sure
         out.element(
             ui::dialog("confirm")
@@ -360,11 +450,12 @@ impl OperatorSession {
                 .parent("confirm_buttons")
                 .label("Yes, do it")
                 .variant("failure")
-                .on_press(Handler::action("confirmed").with_patch(close.clone())),
+                .on_press(Handler::action("confirmed").with_patch(close.clone()).indicator("_busy")),
         );
         out.element(ui::button("confirm_no").parent("confirm_buttons").label("Cancel").variant("plain").on_press(Handler::patch(close)));
 
         self.show_payments(out).await;
+        self.show_wallet(out).await;
         if let Err(e) = self.show_entries(out).await.and(self.show_bans(out)).and(self.show_orders(out)) {
             say(out, "failure", e.to_string());
         }
@@ -388,6 +479,8 @@ impl OperatorSession {
             "orders" => self.show_orders(out),
             "mock_paid" => self.mock_paid(out, a).await,
             "ask_payments" => self.ask_payments(out, a).await,
+            "ask_send" => self.ask_send(out, a).await,
+            "ask_grant" => self.ask_grant(out, a),
             "ask_reveal" => {
                 Self::ask(
                     out,
@@ -452,6 +545,7 @@ impl OperatorSession {
                 format!("Received: {}", sats(i.received)),
                 format!("In accounts: {} · in files: {}", sats(i.in_accounts), sats(i.in_files)),
                 format!("Earned as rent: {} · unclaimed: {}", sats(i.earned), sats(i.unclaimed)),
+                format!("Sent out of the wallet: {}", sats(i.withdrawn)),
             ],
         );
 
@@ -480,7 +574,7 @@ impl OperatorSession {
             "What you have".into(),
             vec![
                 format!("Earned and not sold: {} (worth {})", sats(p.unsold_sats), opt(p.unsold_value_minor)),
-                format!("Sold so far: {}", sats(p.sold_sats)),
+                format!("Sold or sent out so far: {}", sats(p.sold_sats)),
                 format!("In fiat, from sales minus bills: {}", fiat(p.fiat_on_hand_minor)),
                 format!("Price used: {rate}"),
                 format!("All together: {}", opt(p.net_minor)),
@@ -753,6 +847,8 @@ impl OperatorSession {
                 );
             }
             "payments" => return self.save_payments(out, a).await,
+            "send" => return self.send_sats(out, a).await,
+            "grant" => return self.grant(out, a).await,
             "reveal" => {
                 self.seed_shown = true;
                 self.show_payments(out).await;
@@ -996,5 +1092,197 @@ impl OperatorSession {
         out.signal(self.payments_signals());
         self.show_payments(out).await;
         Ok(())
+    }
+
+    // the wallet
+
+    fn withdrawal_from(&self, a: &Action) -> Result<(WithdrawalFrom, String)> {
+        match text(a, "wallet.from").as_str() {
+            "revenue" => Ok((WithdrawalFrom::Revenue, "earnings".into())),
+            "suspense" => Ok((WithdrawalFrom::Suspense, "unclaimed sats".into())),
+            "user" => {
+                let key = parse_pubkey(&text(a, "wallet.account"))
+                    .ok_or_else(|| bad("That isn't a pubkey in hex (64 digits)."))?;
+                Ok((WithdrawalFrom::User(key), format!("account {}", short(&lowercase_hex::encode(key)))))
+            }
+            _ => Err(bad("Pick where the sats come from.")),
+        }
+    }
+
+    fn amount(a: &Action, path: &str) -> Result<u64> {
+        text(a, path)
+            .replace([',', ' '], "")
+            .parse()
+            .map_err(|_| bad("Sats should be a whole number."))
+    }
+
+    fn send_reference(a: &Action, from: WithdrawalFrom, sats: u64) -> String {
+        let source = match from {
+            WithdrawalFrom::Revenue => "revenue".to_string(),
+            WithdrawalFrom::Suspense => "suspense".to_string(),
+            WithdrawalFrom::User(pk) => format!("user:{}", lowercase_hex::encode(pk)),
+        };
+        format!("send:{source}:{}:{sats}:{}", text(a, "wallet.address"), text(a, "wallet.note"))
+    }
+
+    fn grant_reference(a: &Action, sats: u64) -> String {
+        format!(
+            "grant:{}:{sats}:{}",
+            text(a, "wallet.grant_account").to_lowercase(),
+            text(a, "wallet.grant_note")
+        )
+    }
+
+    async fn ask_send(&mut self, out: &mut Outbox, a: &Action) -> Result<()> {
+        let (_, label) = self.withdrawal_from(a)?;
+        let amount = Self::amount(a, "wallet.amount")?;
+        if amount == 0 {
+            return Err(bad("The amount can't be zero."));
+        }
+        let address = text(a, "wallet.address");
+        if address.is_empty() {
+            return Err(bad("An address is needed."));
+        }
+        if !matches!(self.app.config.payments, Some(PaymentsConfig::Mock)) && !arkade::valid_address(&address) {
+            return Err(bad("That isn't an ark address (it starts with ark1 or tark1)."));
+        }
+        Self::ask(
+            out,
+            format!(
+                "Send {} from {label} to {address}? This leaves the wallet and can't be undone.",
+                sats(amount)
+            ),
+            "send",
+            String::new(),
+        );
+        Ok(())
+    }
+
+    async fn send_sats(&mut self, out: &mut Outbox, a: &Action) -> Result<()> {
+        let (from, label) = self.withdrawal_from(a)?;
+        let amount = Self::amount(a, "wallet.amount")?;
+        let address = text(a, "wallet.address");
+        let note = text(a, "wallet.note");
+        let reference = Self::send_reference(a, from, amount);
+        let report = self.app.send_sats(from, &address, amount, &reference, &note).await?;
+        out.signal(json!({"wallet": {"amount": "", "address": "", "note": ""}}));
+        say(
+            out,
+            "success",
+            format!(
+                "Sent {} from {label} to {address} in {}.{}",
+                sats(amount),
+                report.txid,
+                report
+                    .wallet_balance
+                    .map(|b| format!(" The wallet now holds {}.", sats(b)))
+                    .unwrap_or_default()
+            ),
+        );
+        self.show_wallet(out).await;
+        Ok(())
+    }
+
+    fn ask_grant(&mut self, out: &mut Outbox, a: &Action) -> Result<()> {
+        let key = parse_pubkey(&text(a, "wallet.grant_account"))
+            .ok_or_else(|| bad("That isn't a pubkey in hex (64 digits)."))?;
+        let amount = Self::amount(a, "wallet.grant_amount")?;
+        if amount == 0 {
+            return Err(bad("The amount can't be zero."));
+        }
+        Self::ask(
+            out,
+            format!(
+                "Give {} of unclaimed sats to account {}? The wallet doesn't move; only the books change.",
+                sats(amount),
+                short(&lowercase_hex::encode(key))
+            ),
+            "grant",
+            String::new(),
+        );
+        Ok(())
+    }
+
+    async fn grant(&mut self, out: &mut Outbox, a: &Action) -> Result<()> {
+        let key = parse_pubkey(&text(a, "wallet.grant_account"))
+            .ok_or_else(|| bad("That isn't a pubkey in hex (64 digits)."))?;
+        let amount = Self::amount(a, "wallet.grant_amount")?;
+        let note = text(a, "wallet.grant_note");
+        let reference = Self::grant_reference(a, amount);
+        let recorded = self.app.grant_unclaimed(&key, amount, &reference, &note).await?;
+        if recorded {
+            out.signal(json!({"wallet": {"grant_amount": "", "grant_note": ""}}));
+            say(
+                out,
+                "success",
+                format!("Gave {} to {}.", sats(amount), short(&lowercase_hex::encode(key))),
+            );
+        } else {
+            say(out, "info", "That reference was recorded before, nothing changed.");
+        }
+        self.show_wallet(out).await;
+        Ok(())
+    }
+
+    async fn show_wallet(&mut self, out: &mut Outbox) {
+        let app = self.app.clone();
+        let mut lines: Vec<(&str, String)> = vec![];
+        if app.payments.is_ready() {
+            let network = match app.payments.network().await {
+                Ok(Some(n)) if n == "bitcoin" => "mainnet, real money".to_string(),
+                Ok(Some(n)) => format!("{n}, test money"),
+                Ok(None) => "no network".to_string(),
+                Err(e) => format!("the server didn't say: {e}"),
+            };
+            let balance = match app.payments.wallet_balance().await {
+                Ok(Some(b)) => format!("the wallet holds {}", sats(b)),
+                Ok(None) => "the wallet can't be read".into(),
+                Err(e) => format!("the wallet can't be read: {e}"),
+            };
+            lines.push(("success", format!("{network}; {balance}.")));
+        } else {
+            lines.push(("warning", "Payments are not set up, so there is no wallet to send from.".into()));
+        }
+        if let Ok(t) = app.ledger.totals().await {
+            let earnings = t.earned.saturating_sub(t.sold);
+            let sent = t.withdrawn.saturating_add(t.sold.saturating_sub(t.converted));
+            lines.push((
+                "info",
+                format!(
+                    "In the books: {} of earnings, {} unclaimed, {} sent out so far.",
+                    sats(earnings),
+                    sats(t.unclaimed),
+                    sats(sent)
+                ),
+            ));
+        }
+
+        let mut rows = vec![];
+        for (i, (kind, text)) in lines.into_iter().enumerate() {
+            rows.push(ui::notice(format!("wallet_line_{i}")).parent("wallet_status").variant(kind).text(text));
+        }
+        let sends = app.ledger.withdrawals().await.unwrap_or_default();
+        if sends.is_empty() {
+            rows.push(ui::text("wallet_send_none").parent("wallet_sends_card").variant("caption").text("Nothing sent yet."));
+        }
+        for (i, w) in sends.iter().rev().take(ROWS).enumerate() {
+            let note = app
+                .store
+                .note(&crate::ledger::reference_hex_of(w.reference))
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            rows.push(
+                ui::text(format!("wallet_send_{i}")).parent("wallet_sends_card").text(format!(
+                    "{} · {} from {} to {} · {}",
+                    format_date(w.timestamp / 1_000_000_000),
+                    sats(w.sats),
+                    w.from,
+                    short(&w.address),
+                    note
+                )),
+            );
+        }
+        replace(out, &mut self.wallet_rows, rows);
     }
 }

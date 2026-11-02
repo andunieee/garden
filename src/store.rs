@@ -268,7 +268,7 @@ impl Store {
         Ok(out)
     }
 
-    fn setting<T: for<'de> Deserialize<'de>>(&self, key: &str) -> Result<Option<T>> {
+    pub(crate) fn setting<T: for<'de> Deserialize<'de>>(&self, key: &str) -> Result<Option<T>> {
         let tx = self.db.begin_read()?;
         let table = tx.open_table(SETTINGS)?;
         Ok(table
@@ -276,7 +276,7 @@ impl Store {
             .and_then(|v| serde_json::from_str(v.value()).ok()))
     }
 
-    fn set_setting<T: Serialize>(&self, key: &str, value: &T) -> Result<()> {
+    pub(crate) fn set_setting<T: Serialize>(&self, key: &str, value: &T) -> Result<()> {
         let json = serde_json::to_string(value).expect("settings always serialize");
         let tx = self.db.begin_write()?;
         tx.open_table(SETTINGS)?.insert(key, json.as_str())?;

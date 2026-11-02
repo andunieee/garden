@@ -17,6 +17,7 @@ struct System {
     revenue: AccountId,
     suspense: AccountId,
     sold: AccountId,
+    sent: AccountId,
     bank: AccountId,
     fx: AccountId,
 }
@@ -67,6 +68,7 @@ impl OrangeLedger {
                 revenue: account("revenue", LEDGER_SATS)?,
                 suspense: account("suspense", LEDGER_SATS)?,
                 sold: account("sold", LEDGER_SATS)?,
+                sent: account("sent", LEDGER_SATS)?,
                 bank: account("bank", LEDGER_FIAT)?,
                 fx: account("fx", LEDGER_FIAT)?,
             })
@@ -212,6 +214,19 @@ fn file_info(f: &File, a: &Account) -> FileInfo {
         balance: balance(a),
         closed: a.closed,
         timestamp: a.created_at,
+    }
+}
+
+fn withdrawal_of(t: &Transfer) -> Option<Withdrawal> {
+    match &t.memo {
+        Memo::Withdrawal { reference, from, address } => Some(Withdrawal {
+            from: from.clone(),
+            sats: t.amount,
+            address: address.clone(),
+            timestamp: t.at,
+            reference: *reference,
+        }),
+        _ => None,
     }
 }
 
@@ -438,13 +453,26 @@ impl Ledger for OrangeLedger {
     async fn totals(&self) -> Result<Totals> {
         self.read(|tx, sys| {
             let get = |id| tx.accounts().get(id)?.ok_or_else(|| other("system account missing"));
-            let (treasury, revenue, suspense, bank) =
-                (get(sys.treasury)?, get(sys.revenue)?, get(sys.suspense)?, get(sys.bank)?);
+            let (treasury, revenue, suspense, sent, bank) = (
+                get(sys.treasury)?,
+                get(sys.revenue)?,
+                get(sys.suspense)?,
+                get(sys.sent)?,
+                get(sys.bank)?,
+            );
             Ok(Totals {
                 received: treasury.debits,
                 earned: revenue.credits,
                 sold: revenue.debits,
-                unclaimed: suspense.credits,
+                converted: tx
+                    .transfers()
+                    .by_credit(sys.sold)?
+                    .into_iter()
+                    .filter(|t| matches!(t.memo, Memo::Conversion { .. }))
+                    .map(|t| t.amount)
+                    .sum(),
+                withdrawn: sent.credits,
+                unclaimed: balance(&suspense),
                 fiat_in: bank.credits,
                 fiat_out: bank.debits,
             })
@@ -464,6 +492,115 @@ impl Ledger for OrangeLedger {
                 post(tx, Some(key), sys.treasury, sys.suspense, sats, T_UNCLAIMED, Memo::None)?;
             }
             Ok(())
+        })
+        .await
+    }
+
+    async fn record_withdrawal(
+        &self,
+        from: WithdrawalFrom,
+        sats: u64,
+        reference: &str,
+        address: &str,
+    ) -> Result<bool> {
+        let reference = reference.to_string();
+        let address = address.to_string();
+        self.write(move |tx, sys| {
+            if sats == 0 {
+                return Err(other("the amount can't be zero"));
+            }
+            let (source, sink, label) = match from {
+                WithdrawalFrom::Revenue => (sys.revenue, sys.sold, "revenue".to_string()),
+                WithdrawalFrom::Suspense => (sys.suspense, sys.sent, "suspense".to_string()),
+                WithdrawalFrom::User(pk) => (
+                    tx.users().get(Pubkey(pk))?.ok_or(LedgerError::NoSuchAccount)?.account,
+                    sys.sent,
+                    format!("user:{}", lowercase_hex::encode(pk)),
+                ),
+            };
+            let key = transfer_id(&[b"withdraw", reference.as_bytes()]);
+            let memo = Memo::Withdrawal {
+                reference: reference_id(&reference),
+                from: label,
+                address,
+            };
+            if let Some(before) = tx.transfers().by_key(key)? {
+                return if before.memo == memo && before.amount == sats {
+                    Ok(false)
+                } else {
+                    Err(LedgerError::ReferenceReused)
+                };
+            }
+            if balance(&account(tx, source)?) < sats {
+                return Err(LedgerError::InsufficientBalance);
+            }
+            post(tx, Some(key), source, sink, sats, T_WITHDRAW, memo)?;
+            Ok(true)
+        })
+        .await
+    }
+
+    async fn withdrawal(&self, reference: &str) -> Result<Option<Withdrawal>> {
+        let key = transfer_id(&[b"withdraw", reference.as_bytes()]);
+        self.read(move |tx, _| {
+            let Some(t) = tx.transfers().by_key(key)? else {
+                return Ok(None);
+            };
+            Ok(withdrawal_of(&t))
+        })
+        .await
+    }
+
+    async fn withdrawals(&self) -> Result<Vec<Withdrawal>> {
+        self.read(|tx, sys| {
+            let mut out: Vec<Withdrawal> = tx
+                .transfers()
+                .by_credit(sys.sent)?
+                .into_iter()
+                .filter_map(|t| withdrawal_of(&t))
+                .collect();
+            out.extend(
+                tx.transfers()
+                    .by_credit(sys.sold)?
+                    .into_iter()
+                    .filter_map(|t| withdrawal_of(&t)),
+            );
+            out.sort_by_key(|w| w.timestamp);
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn record_grant(&self, pubkey: &PubKeyBytes, sats: u64, reference: &str) -> Result<bool> {
+        let (pubkey, reference) = (*pubkey, reference.to_string());
+        self.write(move |tx, sys| {
+            if sats == 0 {
+                return Err(other("the amount can't be zero"));
+            }
+            let key = transfer_id(&[b"grant", reference.as_bytes()]);
+            let memo = Memo::Grant {
+                reference: reference_id(&reference),
+            };
+            if let Some(before) = tx.transfers().by_key(key)? {
+                return if before.memo == memo && before.amount == sats {
+                    Ok(false)
+                } else {
+                    Err(LedgerError::ReferenceReused)
+                };
+            }
+            if balance(&account(tx, sys.suspense)?) < sats {
+                return Err(LedgerError::InsufficientBalance);
+            }
+            let account = match tx.users().get(Pubkey(pubkey))? {
+                Some(u) => u.account,
+                None => {
+                    let account = new_account(tx, None, LEDGER_SATS, CODE_USER, true)?.id;
+                    tx.users().insert(&User { pubkey: Pubkey(pubkey), account })?;
+                    account
+                }
+            };
+            post(tx, Some(key), sys.suspense, account, sats, T_GRANT, memo)?;
+            Ok(true)
         })
         .await
     }

@@ -97,5 +97,9 @@ pub mod books {
         Conversion { reference: u128, sats: u64, fiat_minor: u64 },
         /// a bill paid to a provider, `date` in unix seconds
         Expense { provider: u32, reference: u128, date: u64 },
+        /// sats sent out of the wallet. `from` is "revenue", "suspense" or "user:<pubkey>".
+        Withdrawal { reference: u128, from: String, address: String },
+        /// sats moved from suspense into a user's account, without touching the wallet
+        Grant { reference: u128 },
     }
 }

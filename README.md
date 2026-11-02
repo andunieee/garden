@@ -25,13 +25,14 @@ The first time, with no `operators` in `garden.toml`, garden logs a setup link l
 
 After that, add more keys to `operators` by hand (`--operator` in the installer does it too). A key that tries and isn't listed is written to the log, ready to be copied. Every request is signed by the key that opened the session.
 
-It has five tabs:
+It has six tabs:
 
 - **Audit**: checks the books (below) over the last 7, 30 or 90 days and lists what looks wrong.
 - **Books**: where you enter, if you want to, what happens outside the server: bills you paid to providers, sats you sold, the price of bitcoin and what each provider charges.
 - **Moderation**: uploaders of a file, files of an account, bans. Destructive actions ask for confirmation.
 - **Rent and orders**: take the day's rent now (it's idempotent), see orders waiting for their payment.
 - **Payments**: pick the Arkade server (mainnet, mutinynet for test money, or another one) and create or restore the wallet, see what it holds, show its seed to back it up. Until this is done nobody can pay. The wallet can't be changed while orders are waiting for their payment, and if `[payments]` is in `garden.toml` the tab only shows it.
+- **Wallet**: what the wallet holds and what the books say is available (earnings, unclaimed sats). Send sats out to an Ark address from any of those, or give unclaimed sats to an account without moving the wallet. Every send is recorded in the books as it happens, so the audit keeps matching; sending the same amount to the same address again needs a new note.
 
 ## The books and the audit
 
@@ -165,11 +166,11 @@ and data, replaces the garden binary, and restarts garden. Never delete
 
 ## Things to know
 
-- Money received on Arkade stays in a wallet derived from its seed (one address per order). Back the seed up (the Payments tab shows it); to spend it, restore it in any Arkade wallet on the same network.
-- An order credits exactly what it asked for. Overpayments are not credited: they are recorded as unclaimed, and so is the part of an order for a file that expired before it was paid (the order says `gone`). The audit shows the total, and it is yours to keep or return.
+- Money received on Arkade stays in a wallet derived from its seed (one address per order). Back the seed up (the Payments tab shows it); the Wallet tab can send it out, and the seed restores it in any Arkade wallet on the same network. The wallet's contracts are kept in `garden.redb`, so a restart still knows the addresses it handed out.
+- An order credits exactly what it asked for. Overpayments are not credited: they are recorded as unclaimed, and so is the part of an order for a file that expired before it was paid (the order says `gone`). The audit shows the total; the Wallet tab can send it back or give it to an account.
 - Uploading a file that is already alive is free and changes nothing.
 - Money received on an address after its order was settled is not in the ledger; the audit shows it as a difference with the wallet.
-- Selling sats means sending them out of the wallet and then telling the books; the audit flags a wallet that holds less than the ledger says.
+- Selling sats means sending them out of the wallet and then telling the books. The Wallet tab does both in one step (it takes them from earnings); if you send from somewhere else, the audit flags the difference until it is recorded.
 - The operator interface is served over http only (no iroh yet).
 - Uploads are held in memory while they are hashed (up to `max_file_size` each).
 - If the server is down for a day, that day's rent is simply not charged.

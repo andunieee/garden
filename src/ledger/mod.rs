@@ -44,6 +44,8 @@ pub const T_RENT: u16 = 4; // file -> revenue
 pub const T_UNCLAIMED: u16 = 6; // treasury -> suspense
 pub const T_CONVERT: u16 = 7; // sats sold for fiat (revenue -> sold, and fx -> bank in fiat)
 pub const T_EXPENSE: u16 = 8; // bank -> a provider's expense account, in fiat
+pub const T_WITHDRAW: u16 = 9; // revenue, suspense or a user -> out of the wallet
+pub const T_GRANT: u16 = 10; // suspense -> a user
 
 pub type Hash = [u8; 32];
 pub type PubKeyBytes = [u8; 32];
@@ -132,14 +134,40 @@ pub struct Totals {
     pub received: u64,
     /// everything rent has ever brought in
     pub earned: u64,
-    /// of which the operator has sold for fiat
+    /// sats that left the revenue account: sold for fiat, or sent out by hand
     pub sold: u64,
+    /// of which was an actual sale (the rest of `sold` was sent out by hand)
+    pub converted: u64,
+    /// sent out of the wallet from suspense or an account (revenue sends count in `sold`)
+    pub withdrawn: u64,
     /// received but not claimed by any order (overpayments, payments for files that expired)
     pub unclaimed: u64,
     /// fiat (minor units) received from selling sats
     pub fiat_in: u64,
     /// fiat (minor units) paid to providers
     pub fiat_out: u64,
+}
+
+/// where sats sent out of the wallet come from
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WithdrawalFrom {
+    /// rent that has been earned and not sold or sent yet
+    Revenue,
+    /// sats that arrived but that no order claimed
+    Suspense,
+    /// what one account holds
+    User(PubKeyBytes),
+}
+
+/// sats that left the wallet
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Withdrawal {
+    /// "revenue", "suspense" or "user:<pubkey>"
+    pub from: String,
+    pub sats: u64,
+    pub address: String,
+    pub timestamp: u64,
+    pub reference: u128,
 }
 
 /// a bill the operator paid to a storage provider
@@ -217,6 +245,28 @@ pub trait Ledger: Send + Sync {
     /// sats that were received and that no order claimed, so the ledger still matches the
     /// wallet. idempotent for each `id`.
     async fn record_unclaimed(&self, sats: u64, id: u128) -> Result<()>;
+
+    /// sats that left the wallet: `sats` from `from` to nobody here. false if this `reference`
+    /// was recorded before with the same values. the caller sends the money; this only keeps
+    /// the books right.
+    async fn record_withdrawal(
+        &self,
+        from: WithdrawalFrom,
+        sats: u64,
+        reference: &str,
+        address: &str,
+    ) -> Result<bool>;
+
+    /// the withdrawal recorded under this reference, if there is one. this is what stops a
+    /// retried send from going out twice.
+    async fn withdrawal(&self, reference: &str) -> Result<Option<Withdrawal>>;
+
+    /// every sats send, newest last
+    async fn withdrawals(&self) -> Result<Vec<Withdrawal>>;
+
+    /// move `sats` from suspense into a user's account (creating it if needed). false if this
+    /// `reference` was recorded before with the same values.
+    async fn record_grant(&self, pubkey: &PubKeyBytes, sats: u64, reference: &str) -> Result<bool>;
 
     /// the operator sold `sats` and got `fiat_minor` for them. false if this `reference` had
     /// been recorded already, an error if with other numbers.
@@ -337,6 +387,7 @@ pub(crate) mod conformance {
     /// has 150 and has been closed (and two more, with 5 and 0), 375 sats of rent were earned
     /// and 1130 sats received
     async fn books(ledger: &dyn Ledger, alice: PubKeyBytes) {
+        let bob = [0xbb; 32];
         let t = ledger.totals().await.unwrap();
         assert_eq!((t.received, t.earned, t.sold, t.unclaimed), (1130, 375, 0, 0));
         assert_eq!((t.fiat_in, t.fiat_out), (0, 0));
@@ -379,11 +430,50 @@ pub(crate) mod conformance {
         assert_eq!(users.len(), 1);
         assert_eq!((users[0].pubkey, users[0].balance), (alice, 600));
 
+        // sats sent out of the wallet
+        let t = ledger.totals().await.unwrap();
+        assert_eq!((t.sold, t.converted, t.withdrawn), (200, 200, 0));
+
+        // from what was earned: it leaves the revenue like a sale does
+        assert!(ledger.record_withdrawal(WithdrawalFrom::Revenue, 100, "send-1", "tark1aaa").await.unwrap());
+        assert!(!ledger.record_withdrawal(WithdrawalFrom::Revenue, 100, "send-1", "tark1aaa").await.unwrap());
+        assert!(matches!(
+            ledger.record_withdrawal(WithdrawalFrom::Revenue, 101, "send-1", "tark1aaa").await,
+            Err(LedgerError::ReferenceReused)
+        ));
+        assert!(matches!(
+            ledger.record_withdrawal(WithdrawalFrom::Revenue, 1000, "send-too-much", "tark1aaa").await,
+            Err(LedgerError::InsufficientBalance)
+        ));
+
+        // from unclaimed and from an account: those go to `sent`
+        assert!(ledger.record_withdrawal(WithdrawalFrom::Suspense, 10, "send-2", "tark1bbb").await.unwrap());
+        assert!(ledger.record_withdrawal(WithdrawalFrom::User(alice), 50, "send-3", "tark1ccc").await.unwrap());
+        let t = ledger.totals().await.unwrap();
+        assert_eq!((t.sold, t.converted, t.withdrawn, t.unclaimed), (300, 200, 60, 20));
+        assert_eq!(ledger.user(&alice).await.unwrap().unwrap().balance, 550);
+        let w = ledger.withdrawal("send-1").await.unwrap().unwrap();
+        assert_eq!((w.from.as_str(), w.sats, w.address.as_str()), ("revenue", 100, "tark1aaa"));
+        assert_eq!(
+            ledger.withdrawals().await.unwrap().iter().map(|w| w.sats).collect::<Vec<_>>(),
+            vec![100, 10, 50]
+        );
+
+        // unclaimed sats can be given to an account instead, without touching the wallet
+        assert!(ledger.record_grant(&bob, 10, "grant-1").await.unwrap());
+        assert!(!ledger.record_grant(&bob, 10, "grant-1").await.unwrap());
+        assert!(matches!(
+            ledger.record_grant(&bob, 1000, "grant-2").await,
+            Err(LedgerError::InsufficientBalance)
+        ));
+        assert_eq!(ledger.user(&bob).await.unwrap().unwrap().balance, 10);
+        assert_eq!(ledger.totals().await.unwrap().unclaimed, 10);
+
         // and everything adds up: what came in is somewhere
         let users: u64 = ledger.users().await.unwrap().iter().map(|u| u.balance).sum();
         let files: u64 = ledger.files().await.unwrap().iter().map(|f| f.balance).sum();
         let held = users + files;
         let t = ledger.totals().await.unwrap();
-        assert_eq!(t.received, held + t.earned + t.unclaimed);
+        assert_eq!(t.received, held + t.earned + t.unclaimed + t.withdrawn);
     }
 }

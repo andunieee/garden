@@ -13,7 +13,7 @@ use tower::ServiceExt;
 
 use crate::app::{App, parse_hash};
 use crate::config::*;
-use crate::ledger::OrangeLedger;
+use crate::ledger::{OrangeLedger, WithdrawalFrom};
 use crate::payments::{MockPayments, Payments, Switch};
 use crate::storage::{MemoryStorage, Providers};
 use crate::store::Store;
@@ -540,6 +540,120 @@ async fn what_is_paid_and_not_used_goes_to_the_suspense_account() {
     assert_eq!(env.balance(&alice).await, 1000);
     let t = env.app.ledger.totals().await.unwrap();
     assert_eq!((t.received, t.unclaimed), (1300, 300));
+}
+
+#[tokio::test]
+async fn the_wallet_sends_and_the_books_follow() {
+    let env = env();
+    let sk = SecretKey::generate();
+    assert_eq!(env.fund(&sk, 2000).await.status, StatusCode::OK);
+
+    // 500 sats arrived without an order claiming them
+    let extra = crate::payments::PaymentRequest {
+        method: "mock".into(),
+        address: "mock:extra".into(),
+        uri: "mock:extra".into(),
+    };
+    assert!(env.payments.simulate(&extra, 500));
+    env.app.ledger.record_unclaimed(500, 1).await.unwrap();
+
+    // the operator sends some of them out
+    let report = env
+        .app
+        .send_sats(WithdrawalFrom::Suspense, "tark1test", 100, "send-1", "rent")
+        .await
+        .unwrap();
+    assert_eq!(report.txid, "mock-send-100");
+    assert_eq!(report.wallet_balance, Some(2400));
+
+    // the same reference can't be sent twice, and the source can't go below zero
+    assert!(env
+        .app
+        .send_sats(WithdrawalFrom::Suspense, "tark1test", 100, "send-1", "rent")
+        .await
+        .is_err());
+    assert!(env
+        .app
+        .send_sats(WithdrawalFrom::Suspense, "tark1test", 1000, "send-2", "")
+        .await
+        .is_err());
+
+    let t = env.app.ledger.totals().await.unwrap();
+    assert_eq!((t.received, t.unclaimed, t.withdrawn), (2500, 400, 100));
+    let a = env.app.audit(1).await.unwrap();
+    assert_eq!(a.integrity.difference, 0);
+    assert_eq!(a.wallet.unwrap().difference, 0);
+
+    // unclaimed sats can be given to an account instead: no wallet movement
+    let bob = SecretKey::generate();
+    assert!(env
+        .app
+        .grant_unclaimed(&bob.pubkey().0, 50, "grant-1", "refund")
+        .await
+        .unwrap());
+    assert!(!env
+        .app
+        .grant_unclaimed(&bob.pubkey().0, 50, "grant-1", "refund")
+        .await
+        .unwrap());
+    assert_eq!(env.balance(&bob).await, 50);
+    assert_eq!(env.app.ledger.totals().await.unwrap().unclaimed, 350);
+    let a = env.app.audit(1).await.unwrap();
+    assert_eq!(a.integrity.difference, 0);
+    assert_eq!(a.wallet.unwrap().difference, 0);
+}
+
+#[tokio::test]
+async fn the_operator_wallet_sends_and_grants() {
+    let env = env();
+    let mut op = operator(&env).await;
+    let sk = SecretKey::generate();
+    assert_eq!(env.fund(&sk, 2000).await.status, StatusCode::OK);
+
+    // a send asks first, then moves the money out of the account
+    let wallet = json!({
+        "from": "user",
+        "account": sk.pubkey().to_hex(),
+        "amount": "500",
+        "address": "tark1test",
+        "note": "a payout",
+    });
+    let out = op.handle(&hyperb_action("ask_send", json!({"wallet": wallet}), None)).await;
+    assert!(out.contains("Send 500 sats"), "{out}");
+    assert!(out.contains("\"action\":\"send\""), "{out}");
+
+    let out = op
+        .handle(&hyperb_action(
+            "confirmed",
+            json!({"wallet": wallet, "confirm": {"open": true, "action": "send", "arg": ""}}),
+            None,
+        ))
+        .await;
+    assert!(out.contains("Sent 500 sats"), "{out}");
+    assert_eq!(env.balance(&sk).await, 1500);
+    assert_eq!(env.app.ledger.totals().await.unwrap().withdrawn, 500);
+
+    // and unclaimed sats can be given to another account without touching the wallet
+    env.app.ledger.record_unclaimed(100, 1).await.unwrap();
+    let bob = SecretKey::generate();
+    let wallet = json!({
+        "from": "revenue",
+        "grant_account": bob.pubkey().to_hex(),
+        "grant_amount": "100",
+        "grant_note": "refund",
+    });
+    let out = op.handle(&hyperb_action("ask_grant", json!({"wallet": wallet}), None)).await;
+    assert!(out.contains("Give 100 sats"), "{out}");
+    let out = op
+        .handle(&hyperb_action(
+            "confirmed",
+            json!({"wallet": wallet, "confirm": {"open": true, "action": "grant", "arg": ""}}),
+            None,
+        ))
+        .await;
+    assert!(out.contains("Gave 100 sats"), "{out}");
+    assert_eq!(env.balance(&bob).await, 100);
+    assert_eq!(env.app.ledger.totals().await.unwrap().unclaimed, 0);
 }
 
 #[tokio::test]

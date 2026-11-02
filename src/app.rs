@@ -11,7 +11,7 @@ use serde::Serialize;
 use sha2::Digest;
 
 use crate::config::{Config, Denied};
-use crate::ledger::{self, Credited, FileInfo, Hash, LedgerError, SharedLedger};
+use crate::ledger::{self, Credited, FileInfo, Hash, LedgerError, SharedLedger, WithdrawalFrom};
 use crate::payments::{Payments, Switch};
 use crate::payments::arkade::Arkade;
 use crate::storage::Providers;
@@ -101,6 +101,14 @@ pub fn parse_pubkey(s: &str) -> Option<[u8; 32]> {
 
 fn hex(bytes: &[u8]) -> String {
     lowercase_hex::encode(bytes)
+}
+
+/// what came of sending sats out of the wallet
+#[derive(Debug, Clone, Serialize)]
+pub struct SendReport {
+    pub txid: String,
+    /// what the wallet holds now, if it can tell
+    pub wallet_balance: Option<u64>,
 }
 
 pub struct App {
@@ -756,6 +764,82 @@ impl App {
         let recorded = self.ledger.record_conversion(reference, sats, fiat_minor).await?;
         if recorded {
             self.store.set_note(&ledger::reference_hex(reference), &label(reference, note))?;
+        }
+        Ok(recorded)
+    }
+
+    /// send sats out of the wallet. the money leaves first and is recorded in the books right
+    /// after, so a send can never be recorded without having happened. a reference that was
+    /// used before is refused, which is what stops a retried send from going out twice.
+    pub async fn send_sats(
+        &self,
+        from: WithdrawalFrom,
+        address: &str,
+        sats: u64,
+        reference: &str,
+        note: &str,
+    ) -> Result<SendReport> {
+        let reference = reference.trim();
+        if reference.is_empty() {
+            return Err(AppError::BadRequest("a reference is needed for every send".into()));
+        }
+        if sats == 0 {
+            return Err(AppError::BadRequest("the amount can't be zero".into()));
+        }
+        if !self.payments.is_ready() {
+            return Err(AppError::Unavailable("this server can't send yet: payments are not set up".into()));
+        }
+        if self.ledger.withdrawal(reference).await?.is_some() {
+            return Err(AppError::BadRequest(
+                "that exact send was recorded before; change the note to send the same amount again".into(),
+            ));
+        }
+
+        let totals = self.ledger.totals().await?;
+        let available = match from {
+            WithdrawalFrom::Revenue => totals.earned.saturating_sub(totals.sold),
+            WithdrawalFrom::Suspense => totals.unclaimed,
+            WithdrawalFrom::User(pubkey) => self.ledger.user(&pubkey).await?.map(|u| u.balance).unwrap_or(0),
+        };
+        if sats > available {
+            return Err(AppError::BadRequest(format!("there are only {available} sats available there")));
+        }
+
+        let txid = self.payments.send(address, sats).await?;
+        let recorded = self.ledger.record_withdrawal(from, sats, reference, address).await?;
+        if !recorded {
+            log::error!("sent {sats} sats in {txid} but the withdrawal {reference} was already in the books");
+        }
+        if !note.trim().is_empty() {
+            self.store.set_note(&ledger::reference_hex(reference), note.trim())?;
+        }
+        let wallet_balance = self.payments.wallet_balance().await.ok().flatten();
+        log::info!("sent {sats} sats to {address} in {txid} ({reference})");
+        Ok(SendReport { txid, wallet_balance })
+    }
+
+    /// give sats that no order claimed to an account. no money moves in the wallet.
+    pub async fn grant_unclaimed(
+        &self,
+        pubkey: &[u8; 32],
+        sats: u64,
+        reference: &str,
+        note: &str,
+    ) -> Result<bool> {
+        let reference = reference.trim();
+        if reference.is_empty() {
+            return Err(AppError::BadRequest("a reference is needed for every grant".into()));
+        }
+        if sats == 0 {
+            return Err(AppError::BadRequest("the amount can't be zero".into()));
+        }
+        let unclaimed = self.ledger.totals().await?.unclaimed;
+        if sats > unclaimed {
+            return Err(AppError::BadRequest(format!("there are only {unclaimed} unclaimed sats")));
+        }
+        let recorded = self.ledger.record_grant(pubkey, sats, reference).await?;
+        if recorded && !note.trim().is_empty() {
+            self.store.set_note(&ledger::reference_hex(reference), note.trim())?;
         }
         Ok(recorded)
     }
