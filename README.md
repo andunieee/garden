@@ -168,6 +168,7 @@ and data, replaces the garden binary, and restarts garden. Never delete
 
 - Money received on Arkade stays in a wallet derived from its seed (one address per order). Back the seed up (the Payments tab shows it); the Wallet tab can send it out, and the seed restores it in any Arkade wallet on the same network. The wallet's contracts are kept in `garden.redb`, so a restart still knows the addresses it handed out.
 - An order credits exactly what it asked for. Overpayments are not credited: they are recorded as unclaimed, and so is the part of an order for a file that expired before it was paid (the order says `gone`). The audit shows the total; the Wallet tab can send it back or give it to an account.
+- The web page at `/` signs with a NIP-07 extension (Alby, nos2x) or a NIP-46 bunker. NIP-07 extensions only work on HTTPS pages or localhost; a bunker works anywhere. The page shows a QR code and the payment network; pay it with an Arkade wallet on that same network (Mutinynet for test money).
 - Uploading a file that is already alive is free and changes nothing.
 - Money received on an address after its order was settled is not in the ledger; the audit shows it as a difference with the wallet.
 - Selling sats means sending them out of the wallet and then telling the books. The Wallet tab does both in one step (it takes them from earnings); if you send from somewhere else, the audit flags the difference until it is recorded.

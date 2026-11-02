@@ -15,6 +15,7 @@ use serde_json::json;
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::app::{App, AppError, parse_hash};
+use crate::payments::Payments;
 use crate::store::{Order, OrderStatus};
 
 type Shared = State<Arc<App>>;
@@ -51,6 +52,15 @@ pub fn router(app: Arc<App>) -> Router {
 
     Router::new()
         .route("/", get(|| async { Html(include_str!("ui.html")) }))
+        .route(
+            "/nostr-bunker.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_str!("nostr-bunker.js"),
+                )
+            }),
+        )
         // blossom
         .route(
             "/upload",
@@ -59,6 +69,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/{name}", get(blob))
         // our api
         .route("/api/info", get(info))
+        .route("/api/qr", get(qr))
         .route("/api/account", get(account))
         .route("/api/account/credit", post(account_credit))
         .route("/api/topup", post(topup))
@@ -88,8 +99,18 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 fn auth(app: &App, headers: &HeaderMap, verb: Verb) -> Result<Auth> {
     let value = header_str(headers, "authorization")
         .ok_or_else(|| AppError::Unauthorized("an Authorization header is required".into()))?;
-    let auth = blossom::verify_auth_header(value, verb, Timestamp::now())
-        .map_err(|e| AppError::Unauthorized(e.to_string()))?;
+    // clients sign with their own clock; a browser a few seconds ahead shouldn't be refused.
+    let auth = match blossom::verify_auth_header(value, verb, Timestamp::now()) {
+        Ok(auth) => auth,
+        // only a start time in the future is retried, with a little slack. everything else,
+        // including the expiration, is checked against the real clock first.
+        Err(blossom::AuthError::FromTheFuture) => {
+            let later = Timestamp((crate::app::now() as u32).saturating_add(60));
+            blossom::verify_auth_header(value, verb, later)
+                .map_err(|e| AppError::Unauthorized(e.to_string()))?
+        }
+        Err(e) => return Err(AppError::Unauthorized(e.to_string())),
+    };
 
     if let Some(host) = url::Url::parse(&app.config.public_url).ok().and_then(|u| {
         u.host_str()
@@ -157,8 +178,34 @@ async fn upload_requirements(State(app): Shared, headers: HeaderMap) -> Result<R
 
 // our api
 
+/// a QR code for an `ark:` payment uri, so a phone wallet can scan it
+async fn qr(uri: Uri) -> Result<Response> {
+    let data = uri
+        .query()
+        .and_then(|q| {
+            url::form_urlencoded::parse(q.as_bytes())
+                .find(|(k, _)| k == "data")
+                .map(|(_, v)| v.into_owned())
+        })
+        .unwrap_or_default();
+    if data.is_empty() {
+        return Err(AppError::BadRequest("data is required".into()));
+    }
+    if data.len() > 512 {
+        return Err(AppError::BadRequest("that is too long for a qr code".into()));
+    }
+    let code = qrcode::QrCode::new(data.as_bytes())
+        .map_err(|e| AppError::BadRequest(format!("can't make a qr code: {e}")))?;
+    let svg = code
+        .render::<qrcode::render::svg::Color>()
+        .min_dimensions(240, 240)
+        .build();
+    Ok(([(header::CONTENT_TYPE, "image/svg+xml")], svg).into_response())
+}
+
 async fn info(State(app): Shared) -> Json<serde_json::Value> {
     let c = &app.config;
+    let network = app.payments.network().await.ok().flatten();
     Json(json!({
         "url": c.public_url,
         "restrictions": {
@@ -173,6 +220,11 @@ async fn info(State(app): Shared) -> Json<serde_json::Value> {
             "base_sats_per_day": c.pricing.base_sats_per_day,
             "sats_per_mib_per_day": c.pricing.sats_per_mib_per_day,
             "min_days": c.pricing.min_days,
+        },
+        "payments": {
+            "ready": app.payments.is_ready(),
+            "method": "arkade",
+            "network": network,
         },
     }))
 }

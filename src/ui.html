@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>garden</title>
+<link rel="icon" href="data:,">
 <style>
   :root {
     --bg: #f6f5f1; --card: #fff; --ink: #1d2a1f; --muted: #667267; --line: #dcdfd6;
@@ -32,6 +33,8 @@
   .err { color: var(--bad); } .ok { color: var(--accent); } .warn { color: var(--warn); }
   .row { display: flex; gap: 8px; } .row > * { flex: 1; } .row > .narrow { flex: 0 0 110px; }
   .order { border-top: 1px dashed var(--line); margin-top: 12px; padding-top: 12px; }
+  .qr { display: block; width: 220px; height: 220px; margin: 8px 0; padding: 8px;
+        background: #fff; border: 1px solid var(--line); border-radius: 8px; }
   .hidden { display: none; }
 </style>
 </head>
@@ -39,15 +42,22 @@
 <main>
   <h1>garden</h1>
   <p class="muted">Files live here as long as there are sats in their account. Anyone can add sats to any file, nobody can delete one.</p>
+  <p id="notice" class="warn hidden"></p>
 
   <section id="login">
     <h2>Account</h2>
-    <p id="who" class="muted">Sign in with a nostr extension (NIP-07) to upload.</p>
-    <button id="connect">Sign in</button>
+    <p id="who" class="muted">Sign in to upload and pay.</p>
+    <p class="muted">A NIP-07 extension (Alby, nos2x) only works on HTTPS or localhost. A NIP-46 bunker works anywhere.</p>
+    <button id="connect">Sign in with an extension</button>
+    <label for="bunker">Or connect to a bunker (NIP-46)</label>
+    <div class="row"><input id="bunker" placeholder="bunker://…"><button id="bunker-go" class="narrow">Connect</button></div>
+    <p id="bunker-out" class="muted"></p>
     <div id="acct" class="hidden">
       <p>Balance: <b id="balance">0</b> sats <span id="noacct" class="warn hidden">(no account yet, pay to create it)</span></p>
       <label for="credit">Add sats to your account</label>
-      <div class="row"><input id="credit" type="number" min="1" value="1000"><button id="credit-go" class="narrow">Pay</button></div>
+      <div class="row"><input id="credit" type="number" min="1" step="1" value="1000"><button id="credit-go" class="narrow">Pay</button></div>
+      <p id="credit-out" class="err"></p>
+      <button id="signout" class="plain">Sign out</button>
     </div>
   </section>
 
@@ -78,19 +88,25 @@
   <div id="orders"></div>
 </main>
 
+<script src="/nostr-bunker.js"></script>
 <script>
 const $ = (id) => document.getElementById(id);
 let pubkey = null;
 let info = null;
+let signer = null;
+let session = 0;
 
+const BUNKER_KEY = 'garden.bunker';
 const hex = (buf) => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
+const unhex = (s) => new Uint8Array((s.match(/../g) || []).map((b) => parseInt(b, 16)));
 const sha256 = async (buf) => hex(await crypto.subtle.digest('SHA-256', buf));
 const say = (el, text, cls = '') => { el.textContent = text; el.className = cls; };
 
 // the Authorization header of blossom (BUD-01): a signed event of kind 24242
 async function authHeader(verb, hashes = []) {
+  if (!signer) throw new Error('Sign in first.');
   const now = Math.floor(Date.now() / 1000);
-  const event = await window.nostr.signEvent({
+  const event = await signer.signEvent({
     kind: 24242,
     created_at: now,
     content: verb,
@@ -116,51 +132,188 @@ async function refreshAccount() {
   $('noacct').classList.toggle('hidden', a.exists);
 }
 
+async function signedIn(pk, how) {
+  pubkey = pk;
+  say($('who'), 'Signed in as ' + pk.slice(0, 12) + '… (' + how + ')', 'mono');
+  $('connect').classList.add('hidden');
+  $('acct').classList.remove('hidden');
+  $('upload-box').classList.remove('hidden');
+  await refreshAccount();
+}
+
+function signOut() {
+  session++;
+  const old = signer;
+  signer = null;
+  if (old && old !== window.nostr && old.close) old.close().catch(() => {});
+  pubkey = null;
+  localStorage.removeItem(BUNKER_KEY);
+  $('acct').classList.add('hidden');
+  $('upload-box').classList.add('hidden');
+  $('connect').classList.remove('hidden');
+  say($('who'), 'Sign in to upload and pay.', 'muted');
+  say($('bunker-out'), '');
+  $('balance').textContent = '0';
+}
+
 $('connect').onclick = async () => {
-  if (!window.nostr) return say($('who'), 'No nostr extension found.', 'err');
+  if (!window.nostr) return say($('who'), 'No nostr extension found. NIP-07 signers only inject on https pages or localhost.', 'err');
+  const old = signer;
+  const gen = ++session;
   try {
-    pubkey = await window.nostr.getPublicKey();
-    say($('who'), 'Signed in as ' + pubkey.slice(0, 12) + '…', 'mono');
-    $('connect').classList.add('hidden');
-    $('acct').classList.remove('hidden');
-    $('upload-box').classList.remove('hidden');
-    await refreshAccount();
-  } catch (e) { say($('who'), e.message, 'err'); }
+    const pk = await window.nostr.getPublicKey();
+    if (gen !== session) return;
+    if (old && old !== window.nostr && old.close) old.close().catch(() => {});
+    signer = window.nostr;
+    await signedIn(pk, 'extension');
+  } catch (e) {
+    if (gen === session) signer = old;
+    say($('who'), e.message, 'err');
+  }
 };
+
+$('signout').onclick = signOut;
+
+$('bunker-go').onclick = async () => {
+  const out = $('bunker-out');
+  const button = $('bunker-go');
+  const input = $('bunker').value.trim();
+  if (!input) return say(out, 'Paste a bunker:// URL or a NIP-05 address.', 'err');
+  if (!window.NostrBunkerKit) return say(out, 'The bunker library did not load. Reload the page.', 'err');
+  say(out, 'Waiting for your signer to approve this browser…');
+  button.disabled = true;
+  button.textContent = 'Connecting…';
+  const old = signer;
+  const gen = ++session;
+  try {
+    const bp = await NostrBunkerKit.parseBunkerInput(input);
+    if (!bp) throw new Error('That is not a bunker:// URL or a NIP-05 address.');
+    const sk = NostrBunkerKit.generateSecretKey();
+    const b = NostrBunkerKit.BunkerSigner.fromBunker(sk, bp, {
+      pool: new NostrBunkerKit.SimplePool(),
+      onauth: (url) => {
+        window.open(url, '_blank', 'noopener');
+        say(out, 'Approve it in the signer, then come back.', 'warn');
+      },
+    });
+    await b.connect({ name: 'garden', url: location.origin });
+    if (gen !== session) { b.close().catch(() => {}); return; }
+    const pk = await b.getPublicKey();
+    if (gen !== session) { b.close().catch(() => {}); return; }
+    if (signer && signer !== window.nostr && signer.close) signer.close().catch(() => {});
+    signer = b;
+    localStorage.setItem(BUNKER_KEY, JSON.stringify({ input, sk: hex(sk) }));
+    await signedIn(pk, 'bunker');
+    say(out, 'Connected with a bunker.', 'ok');
+  } catch (e) {
+    if (gen === session) signer = old;
+    say(out, e.message, 'err');
+  } finally {
+    button.disabled = false;
+    button.textContent = 'Connect';
+  }
+};
+
+// come back to a bunker session without asking again
+(async () => {
+  const raw = localStorage.getItem(BUNKER_KEY);
+  if (!raw || !window.NostrBunkerKit) return;
+  const gen = session;
+  try {
+    const saved = JSON.parse(raw);
+    const bp = await NostrBunkerKit.parseBunkerInput(saved.input);
+    if (!bp) return;
+    const b = NostrBunkerKit.BunkerSigner.fromBunker(unhex(saved.sk), bp, {
+      pool: new NostrBunkerKit.SimplePool(),
+      onauth: (url) => window.open(url, '_blank', 'noopener'),
+    });
+    await b.connect({ name: 'garden', url: location.origin });
+    if (gen !== session) { b.close().catch(() => {}); return; }
+    const pk = await b.getPublicKey();
+    if (gen !== session) { b.close().catch(() => {}); return; }
+    signer = b;
+    await signedIn(pk, 'bunker');
+    $('bunker').value = saved.input;
+  } catch (e) { /* stay signed out; the form is still there */ }
+})();
+
+function networkLabel(n) {
+  if (n === 'bitcoin') return 'Arkade mainnet (real money)';
+  if (n === 'signet' || n === 'mutinynet') return 'Arkade Mutinynet (test money)';
+  return n ? `Arkade (${n})` : 'Arkade';
+}
 
 // orders: show where to pay and wait for the payment
 function showOrder(order, title) {
   const box = document.createElement('section');
   box.className = 'order';
-  box.innerHTML = `<h2></h2><p>Send exactly <b class="amount"></b> sats on Arkade to:</p>
-    <p class="mono address"></p><p><a class="pay">Open in wallet</a></p><p class="status warn">Waiting for the payment…</p>`;
+  box.innerHTML = `<h2></h2>
+    <p>Send exactly <b class="amount"></b> sats with an Arkade wallet on <b class="network"></b> to:</p>
+    <img class="qr" alt="QR code for the payment address">
+    <p class="mono address"></p>
+    <p><button class="plain copy">Copy address</button> <a class="pay">Open in wallet</a></p>
+    <p class="muted help"></p>
+    <p class="status warn">Waiting for the payment…</p>`;
   box.querySelector('h2').textContent = title;
   box.querySelector('.amount').textContent = order.amount_sats;
+  const network = networkLabel(info?.payments?.network);
+  box.querySelector('.network').textContent = network;
   box.querySelector('.address').textContent = order.payment.address;
+  box.querySelector('.qr').src = '/api/qr?data=' + encodeURIComponent(order.payment.uri);
   box.querySelector('.pay').href = order.payment.uri;
+  box.querySelector('.help').textContent = info?.payments?.ready === false
+    ? 'This server cannot take payments yet.'
+    : `Only an Arkade wallet on ${network} can pay this address. The address is for this order only.`;
+  box.querySelector('.copy').onclick = async () => {
+    try {
+      await navigator.clipboard.writeText(order.payment.address);
+      box.querySelector('.copy').textContent = 'Copied';
+    } catch (e) { /* the address can still be selected by hand */ }
+  };
   $('orders').prepend(box);
+  box.scrollIntoView({ behavior: 'smooth', block: 'center' });
 
+  let failures = 0;
   const timer = setInterval(async () => {
     try {
       const o = await api('GET', '/api/orders/' + order.id);
+      failures = 0;
       if (o.status !== 'paid') return;
       clearInterval(timer);
       const gone = o.credits.filter((c) => c.result === 'gone').length;
       const st = box.querySelector('.status');
       say(st, gone ? `Paid, but ${gone} file(s) had expired already.` : 'Paid, thank you!', gone ? 'warn' : 'ok');
-      if (pubkey) refreshAccount();
-    } catch (e) { /* keep trying */ }
+      if (pubkey) refreshAccount().catch(() => {});
+    } catch (e) {
+      failures++;
+      if (failures >= 3) {
+        clearInterval(timer);
+        say(box.querySelector('.status'), 'Could not read the order: ' + e.message, 'err');
+      }
+    }
   }, 3000);
 }
 
 $('credit-go').onclick = async () => {
+  const out = $('credit-out');
+  const button = $('credit-go');
+  say(out, '');
+  const sats = Math.floor(Number($('credit').value));
+  if (!Number.isFinite(sats) || sats < 1) return say(out, 'Enter a whole number of sats.', 'err');
+  button.disabled = true;
+  button.textContent = 'Creating…';
   try {
     const order = await api('POST', '/api/account/credit', {
       auth: await authHeader('account'),
-      body: { amount_sats: Number($('credit').value) },
+      body: { amount_sats: sats },
     });
     showOrder(order, 'Add sats to your account');
-  } catch (e) { alert(e.message); }
+  } catch (e) {
+    say(out, e.message, 'err');
+  } finally {
+    button.disabled = false;
+    button.textContent = 'Pay';
+  }
 };
 
 $('upload-go').onclick = async () => {
@@ -227,6 +380,17 @@ api('GET', '/api/info').then((i) => {
   const mib = (i.restrictions.max_file_size / 1048576).toFixed(0);
   $('price').textContent = `Up to ${mib} MiB. Hosting costs ${i.pricing.base_sats_per_day} sat/day plus ${i.pricing.sats_per_mib_per_day} per MiB; new files are funded for at least ${i.pricing.min_days} days. First payment is at least ${i.restrictions.min_account_payment_sats} sats.`;
   $('credit').value = i.restrictions.min_account_payment_sats;
+
+  const notice = $('notice');
+  if (!i.payments || !i.payments.ready) {
+    notice.textContent = 'This server cannot take payments yet: the operator has to set them up in the dashboard.';
+    notice.classList.remove('hidden');
+    $('credit-go').disabled = true;
+    $('fund-go').disabled = true;
+  } else if (i.payments.network && i.payments.network !== 'bitcoin') {
+    notice.textContent = `Payments are on ${networkLabel(i.payments.network)}. Real sats will not work here.`;
+    notice.classList.remove('hidden');
+  }
 });
 </script>
 </body>

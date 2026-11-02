@@ -374,6 +374,59 @@ async fn authorization_is_checked() {
     assert_eq!(r.status, StatusCode::UNAUTHORIZED);
 }
 
+fn base64_standard(bytes: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(A[(n >> 18) as usize & 63] as char);
+        out.push(A[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { A[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { A[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+#[tokio::test]
+async fn a_client_clock_a_little_ahead_is_accepted() {
+    let env = env();
+    let sk = SecretKey::generate();
+    let now = ritualistic::Timestamp::now();
+    let event = ritualistic::EventTemplate {
+        created_at: ritualistic::Timestamp(now.0 + 30),
+        kind: ritualistic::Kind(24242),
+        tags: ritualistic::Tags(vec![
+            vec!["t".to_string(), "account".to_string()],
+            vec!["expiration".to_string(), (now.0 + 300).to_string()],
+        ]),
+        content: "account".to_string(),
+    }
+    .finalize(&sk);
+    let header = format!("Nostr {}", base64_standard(serde_json::to_string(&event).unwrap().as_bytes()));
+    let r = env
+        .json("POST", "/api/account/credit", &[("authorization", header)], json!({ "amount_sats": 1000 }))
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn the_page_knows_what_to_pay_with() {
+    let env = env();
+    let r = env.call("GET", "/api/info", &[], vec![]).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(r.body["payments"]["ready"], true);
+    assert_eq!(r.body["payments"]["method"], "arkade");
+    assert!(r.body["payments"].get("network").is_some());
+
+    let r = env.call("GET", "/api/qr?data=ark%3Atark1test", &[], vec![]).await;
+    assert_eq!(r.status, StatusCode::OK);
+
+    // the page needs the NIP-46 bundle to be served
+    let r = env.call("GET", "/nostr-bunker.js", &[], vec![]).await;
+    assert_eq!(r.status, StatusCode::OK);
+}
+
 #[tokio::test]
 async fn restrictions() {
     let carol = SecretKey::generate();

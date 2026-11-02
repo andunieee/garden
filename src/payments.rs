@@ -391,6 +391,8 @@ pub mod arkade {
 
     pub struct Arkade {
         client: Client<NoChain, NoWallet, InMemorySwapStorage>,
+        /// what arkd said at connect; the network does not change under a wallet
+        network: String,
     }
 
     impl Arkade {
@@ -433,7 +435,8 @@ pub mod arkade {
                 client.restore_contracts(gap).await.map_err(err)?;
             }
 
-            Ok(Self { client })
+            let network = client.server_info().await.map_err(err)?.network.to_string();
+            Ok(Self { client, network })
         }
     }
 
@@ -517,7 +520,7 @@ pub mod arkade {
 
         /// what the server says it is on: "bitcoin" on mainnet, "signet" on mutinynet
         async fn network(&self) -> Result<Option<String>, PaymentError> {
-            Ok(Some(self.client.server_info().await.map_err(err)?.network.to_string()))
+            Ok(Some(self.network.clone()))
         }
     }
 }
