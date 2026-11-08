@@ -16,8 +16,6 @@
 
 #[orangedb::schema]
 pub mod books {
-    use serde::{Deserialize, Serialize};
-
     #[entity]
     #[derive(Debug, Clone, PartialEq)]
     pub struct Account {
@@ -88,7 +86,8 @@ pub mod books {
     }
 
     /// what a transfer says besides moving money
-    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[embed]
+    #[derive(Debug, Clone, PartialEq)]
     pub enum Memo {
         None,
         /// the day of rent a file paid, and to which provider it went
